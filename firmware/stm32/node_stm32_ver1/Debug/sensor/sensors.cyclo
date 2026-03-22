@@ -1,0 +1,9 @@
+../sensor/sensors.c:22:14:calc_altitude	1
+../sensor/sensors.c:31:16:_init_sht30	4
+../sensor/sensors.c:55:16:_init_bmp388	11
+../sensor/sensors.c:106:9:Sensors_Init	3
+../sensor/sensors.c:119:9:Sensors_ReadSHT30	4
+../sensor/sensors.c:142:9:Sensors_ReadBMP388	4
+../sensor/sensors.c:165:6:Sensors_ReadAll	2
+../sensor/sensors.c:172:6:Sensors_Print	4
+../sensor/sensors.c:200:6:Sensors_Deinit	3

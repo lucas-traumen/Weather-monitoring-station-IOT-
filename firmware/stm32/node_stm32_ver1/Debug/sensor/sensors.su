@@ -1,0 +1,9 @@
+../sensor/sensors.c:22:14:calc_altitude	16	static
+../sensor/sensors.c:31:16:_init_sht30	8	static
+../sensor/sensors.c:55:16:_init_bmp388	8	static
+../sensor/sensors.c:106:9:Sensors_Init	16	static
+../sensor/sensors.c:119:9:Sensors_ReadSHT30	40	static
+../sensor/sensors.c:142:9:Sensors_ReadBMP388	40	static
+../sensor/sensors.c:165:6:Sensors_ReadAll	16	static
+../sensor/sensors.c:172:6:Sensors_Print	16	static
+../sensor/sensors.c:200:6:Sensors_Deinit	8	static
