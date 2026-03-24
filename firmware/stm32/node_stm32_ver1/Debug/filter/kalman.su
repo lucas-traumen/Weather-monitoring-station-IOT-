@@ -1,0 +1,7 @@
+../filter/kalman.c:4:6:SimpleKalmanFilter_Init	24	static
+../filter/kalman.c:14:7:SimpleKalmanFilter_Update	32	static
+../filter/kalman.c:24:6:SimpleKalmanFilter_SetMeasurementError	16	static
+../filter/kalman.c:28:6:SimpleKalmanFilter_SetEstimateError	16	static
+../filter/kalman.c:32:6:SimpleKalmanFilter_SetProcessNoise	16	static
+../filter/kalman.c:36:7:SimpleKalmanFilter_GetKalmanGain	16	static
+../filter/kalman.c:40:7:SimpleKalmanFilter_GetEstimateError	16	static

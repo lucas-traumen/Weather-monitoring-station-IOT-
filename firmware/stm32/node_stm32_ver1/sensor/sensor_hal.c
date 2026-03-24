@@ -12,11 +12,12 @@
 #include <string.h>
 
 
+
 #define ENABLE_DEBUG_LOG  1
 #define TX_RING_BUF_SIZE 1024U  // Bắt buộc phải là Lũy thừa của 2 (Power of 2)
 
-static ring_buffer_t tx_ring_buffer;
-static char tx_buffer_data[TX_RING_BUF_SIZE];
+ ring_buffer_t tx_ring_buffer;
+ char tx_buffer_data[TX_RING_BUF_SIZE];
 
 static volatile uint8_t  tx_dma_running = 0;
 static volatile uint16_t tx_dma_send_len = 0;
@@ -92,6 +93,8 @@ uint32_t min_time_ms(void)
     return HAL_GetTick(); // Cung cấp thời gian cho MIN
 }
 
+
+
 /* ══════════════════════════════════════════════════════════════════════════
  * HÀM IN LOG DEBUG CỦA BÁC
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -114,7 +117,21 @@ void sensor_debug_print(const char *const fmt, ...)
     }
 #endif
 }
+#ifdef MIN_DEBUG_PRINTING
+void min_debug_print(const char *msg, ...)
+{
+    char buf[256]; // Bộ đệm tạm để chứa chuỗi
+    va_list args;
 
+    /* 1. Gom tất cả các tham số (..., %d, %f) lại thành một chuỗi hoàn chỉnh */
+    va_start(args, msg);
+    vsnprintf(buf, sizeof(buf), msg, args);
+    va_end(args);
+
+    /* 2. Nhét thêm chữ [MIN] vào trước để dễ phân biệt, rồi đẩy vào kho DMA */
+    sensor_debug_print("[MIN_DEBUG] %s", buf);
+}
+#endif
 void sensor_delay_ms(uint32_t ms)
 {
     HAL_Delay(ms);

@@ -1,0 +1,2 @@
+source D:/Github/Course-Project-1/firmware/esp32/build/gdbinit/symbols
+source D:/Github/Course-Project-1/firmware/esp32/build/gdbinit/connect

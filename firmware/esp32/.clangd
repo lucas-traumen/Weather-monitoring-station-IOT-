@@ -1,0 +1,3 @@
+CompileFlags:
+  CompilationDatabase: D:\Github\Course-Project-1\firmware\esp32\build
+  Remove: [-m*, -f*]

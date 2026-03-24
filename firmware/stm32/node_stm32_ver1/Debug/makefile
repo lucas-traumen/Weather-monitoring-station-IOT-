@@ -13,6 +13,7 @@ RM := rm -rf
 -include sensor/bmp388/subdir.mk
 -include sensor/subdir.mk
 -include protocol/subdir.mk
+-include filter/subdir.mk
 -include Drivers/STM32F1xx_HAL_Driver/Src/subdir.mk
 -include Core/Startup/subdir.mk
 -include Core/Src/subdir.mk

@@ -23,6 +23,8 @@
 /* USER CODE BEGIN Includes */
 #include "telemetry.h"
 #include "sensor_hal.h"
+#include "kalman.h"
+#include "ema.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -59,8 +61,14 @@ DMA_HandleTypeDef hdma_usart1_tx;
 /* USER CODE BEGIN PV */
 
 struct min_context min_ctx;
-SensorData_t sensor_data;
+SensorData_t sensor_data1;
+SensorData_t sensor_data2;
 uint8_t battery_level = 85; // Giả lập pin
+SimpleKalmanFilter_t pressure_kf;
+SimpleKalmanFilter_t altitude_kf;
+DynamicEMA_t temp_env_filter;
+DynamicEMA_t temp_board_filter;
+DynamicEMA_t hum_filter;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -129,6 +137,15 @@ int main(void)
       Sensors_Init();
 
       sensor_debug_print("\r\n=== System Boot OK! ===\r\n");
+
+      SimpleKalmanFilter_Init(&pressure_kf, 2.0f, 2.0f, 0.01f);
+      SimpleKalmanFilter_Init(&altitude_kf, 2.0f, 2.0f, 0.01f);
+
+      DynamicEMA_Init(&temp_env_filter, 0.1f, 0.8f, 0.5f);
+      DynamicEMA_Init(&temp_board_filter, 0.1f, 0.8f, 0.5f);
+          // Độ ẩm: Độ ẩm thường nhảy múa khá nhanh, chênh lệch > 2.0% thì bám theo
+      DynamicEMA_Init(&hum_filter, 0.1f, 0.8f, 2.0f);
+
 //  sensor_debug_print("\r\n--- Bat dau quet bus I2C1 ---\r\n");
 //
 //  HAL_StatusTypeDef res;
@@ -165,17 +182,30 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  Sensors_ReadAll(&sensor_data);
-	        // 2. In Log ra Terminal cho bác xem (dạng chữ)
-	        sensor_debug_print("[INFO] Nhiet do: %.2f C, Ap suat: %.2f hPa\r\n",
-	                           sensor_data.env.temperature_c,
-	                           sensor_data.board.pressure_hpa);
-	        // 3. Gửi chuỗi Byte Hex cực gọn qua MIN Protocol cho Python/Server đọc
-	        Telemetry_Send_MIN(&min_ctx, &sensor_data, battery_level);
+	  Sensors_ReadAll(&sensor_data1);
+	  HAL_Delay(50);
+	  Sensors_ReadAll(&sensor_data2);
 
-	        // 4. Bác có thể MIN_Poll() ở đây nếu có nhận lệnh từ máy tính xuống
-	        // min_poll(&min_ctx, rx_buf, rx_len);
-	        HAL_Delay(2000); // Bây giờ bác có thể delay ngắn lại thoải mái
+	          // 2. Chạy qua bộ lọc Kalman TÁCH BIỆT
+	          if (sensor_data1.board.valid) {
+	              // Lọc Áp suất (nhét vào pressure_kf)
+	              sensor_data1.board.pressure_hpa = SimpleKalmanFilter_Update(&pressure_kf, sensor_data1.board.pressure_hpa);
+
+	              // Lọc Độ cao (nhét vào altitude_kf)
+	              sensor_data1.board.altitude_m = SimpleKalmanFilter_Update(&altitude_kf, sensor_data1.board.altitude_m);
+	          }
+	          if (sensor_data1.env.valid && sensor_data1.board.valid) {
+	                      // Chạy dữ liệu qua bộ lọc thông minh
+	                      sensor_data1.env.temperature_c = DynamicEMA_Update(&temp_env_filter, sensor_data1.env.temperature_c);
+	                      sensor_data1.env.humidity_pct  = DynamicEMA_Update(&hum_filter, sensor_data1.env.humidity_pct);
+	          }
+
+	          // 3. Gửi đi như bình thường
+	          Telemetry_Send_MIN(&min_ctx, &sensor_data1, battery_level);
+		 	          HAL_Delay(500);
+
+
+
   }
   /* USER CODE END 3 */
 }

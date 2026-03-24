@@ -18,6 +18,8 @@
 "./Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rcc.o"
 "./Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rcc_ex.o"
 "./Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.o"
+"./filter/ema.o"
+"./filter/kalman.o"
 "./protocol/min.o"
 "./protocol/ringbuffer.o"
 "./protocol/telemetry.o"
