@@ -1,7 +1,7 @@
-../sensor/sht30/driver_sht30.c:82:16:a_sht30_write	2
-../sensor/sht30/driver_sht30.c:105:16:a_sht30_write_bytes	2
-../sensor/sht30/driver_sht30.c:128:16:a_sht30_read	2
-../sensor/sht30/driver_sht30.c:147:16:a_sht30_crc	4
+../sensor/sht30/driver_sht30.c:82:16:a_sht30_write	1
+../sensor/sht30/driver_sht30.c:128:16:a_sht30_read	1
+../sensor/sht30/driver_sht30.c:147:16:a_sht30_crc.constprop	5
+../sensor/sht30/driver_sht30.c:105:16:a_sht30_write_bytes.constprop	1
 ../sensor/sht30/driver_sht30.c:175:9:sht30_init	10
 ../sensor/sht30/driver_sht30.c:249:9:sht30_deinit	5
 ../sensor/sht30/driver_sht30.c:292:9:sht30_set_addr_pin	2

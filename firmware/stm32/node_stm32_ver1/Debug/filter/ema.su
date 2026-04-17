@@ -1,2 +1,0 @@
-../filter/ema.c:4:6:DynamicEMA_Init	24	static
-../filter/ema.c:12:7:DynamicEMA_Update	32	static

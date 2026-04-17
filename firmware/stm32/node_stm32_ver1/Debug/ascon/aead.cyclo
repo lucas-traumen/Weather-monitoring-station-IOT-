@@ -1,0 +1,12 @@
+../ascon/aead.c:14:18:ascon_loadkey	1
+../ascon/aead.c:25:18:ascon_initaead	1
+../ascon/aead.c:52:18:ascon_adata	5
+../ascon/aead.c:83:18:ascon_encrypt	4
+../ascon/aead.c:118:18:ascon_decrypt	4
+../ascon/aead.c:162:18:ascon_final	1
+../ascon/aead.c:188:18:ascon_gettag	1
+../ascon/aead.c:193:17:ascon_verify	1
+../ascon/aead.c:200:5:ascon_aead_encrypt	1
+../ascon/aead.c:214:5:ascon_aead_decrypt	1
+../ascon/aead.c:227:5:crypto_aead_encrypt	1
+../ascon/aead.c:249:5:crypto_aead_decrypt	2

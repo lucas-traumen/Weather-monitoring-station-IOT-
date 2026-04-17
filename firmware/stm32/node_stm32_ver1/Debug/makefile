@@ -12,8 +12,7 @@ RM := rm -rf
 -include sensor/sht30/subdir.mk
 -include sensor/bmp388/subdir.mk
 -include sensor/subdir.mk
--include protocol/subdir.mk
--include filter/subdir.mk
+-include ascon/subdir.mk
 -include Drivers/STM32F1xx_HAL_Driver/Src/subdir.mk
 -include Core/Startup/subdir.mk
 -include Core/Src/subdir.mk
@@ -66,7 +65,7 @@ main-build: node_stm32_ver1.elf secondary-outputs
 
 # Tool invocations
 node_stm32_ver1.elf node_stm32_ver1.map: $(OBJS) $(USER_OBJS) D:\Github\Course-Project-1\firmware\stm32\node_stm32_ver1\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "node_stm32_ver1.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"D:\Github\Course-Project-1\firmware\stm32\node_stm32_ver1\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="node_stm32_ver1.map" -Wl,--gc-sections -static -fshort-enums --specs=nano.specs -mfloat-abi=soft -mthumb -u _printf_float -Wl,--start-group -lc -lm -Wl,--end-group
+	arm-none-eabi-gcc -o "node_stm32_ver1.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"D:\Github\Course-Project-1\firmware\stm32\node_stm32_ver1\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="node_stm32_ver1.map" -Wl,--gc-sections -static -fshort-enums --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

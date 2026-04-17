@@ -59,14 +59,28 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define LED_DEBUG_Pin GPIO_PIN_13
 #define LED_DEBUG_GPIO_Port GPIOC
-#define TxPin_Pin GPIO_PIN_9
-#define TxPin_GPIO_Port GPIOA
-#define RxPin_Pin GPIO_PIN_10
-#define RxPin_GPIO_Port GPIOA
-#define SCL_Pin GPIO_PIN_6
-#define SCL_GPIO_Port GPIOB
-#define SDA_Pin GPIO_PIN_7
-#define SDA_GPIO_Port GPIOB
+#define LORA_AUX_Pin GPIO_PIN_1
+#define LORA_AUX_GPIO_Port GPIOA
+#define LORA_TX_Pin GPIO_PIN_2
+#define LORA_TX_GPIO_Port GPIOA
+#define LORA_RX_Pin GPIO_PIN_3
+#define LORA_RX_GPIO_Port GPIOA
+#define LORA_M0_Pin GPIO_PIN_4
+#define LORA_M0_GPIO_Port GPIOA
+#define LORA_M1_Pin GPIO_PIN_5
+#define LORA_M1_GPIO_Port GPIOA
+#define SOURCE_SCL_Pin GPIO_PIN_10
+#define SOURCE_SCL_GPIO_Port GPIOB
+#define SOURCE_SDA_Pin GPIO_PIN_11
+#define SOURCE_SDA_GPIO_Port GPIOB
+#define Print_TX_Pin GPIO_PIN_9
+#define Print_TX_GPIO_Port GPIOA
+#define Print_RX_Pin GPIO_PIN_10
+#define Print_RX_GPIO_Port GPIOA
+#define ENV_SCL_Pin GPIO_PIN_6
+#define ENV_SCL_GPIO_Port GPIOB
+#define ENV_SDA_Pin GPIO_PIN_7
+#define ENV_SDA_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
