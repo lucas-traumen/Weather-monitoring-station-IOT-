@@ -40,29 +40,55 @@ void sensor_debug_print(const char *const fmt, ...)
 /* ====================================================================
  * 2. ĐIỀU KHIỂN LORA E32 (Tích hợp chống treo AUX)
  * ==================================================================== */
+//void sensor_lora_transmit(uint8_t *payload, uint16_t len)
+//{
+//    // Bước 1: Kéo M0=0, M1=0 để đưa E32 về chế độ Normal (Truyền nhận)
+//    HAL_GPIO_WritePin(LORA_M0_PORT, LORA_M0_PIN, GPIO_PIN_RESET);
+//    HAL_GPIO_WritePin(LORA_M1_PORT, LORA_M1_PIN, GPIO_PIN_RESET);
+//
+//    // Bước 2: Chờ module E32 sẵn sàng (AUX bật lên HIGH)
+//    while(HAL_GPIO_ReadPin(LORA_AUX_PORT, LORA_AUX_PIN) == GPIO_PIN_RESET) {
+//        HAL_IWDG_Refresh(&hiwdg); // Trấn an chó Watchdog
+//    }
+//
+//    // Bước 3: Đẩy gói tin 15-Byte qua UART vào bộ đệm của E32
+//    HAL_UART_Transmit(&huart2, payload, len, 100);
+//
+//    // Bước 4: Chờ E32 phát xong dữ liệu vô tuyến ra không trung (AUX lại lên HIGH)
+//    // Cực kỳ quan trọng: Nếu cắt điện ngủ lúc AUX đang LOW, gói tin sẽ rớt giữa chừng!
+//    while(HAL_GPIO_ReadPin(LORA_AUX_PORT, LORA_AUX_PIN) == GPIO_PIN_RESET) {
+//        HAL_IWDG_Refresh(&hiwdg);
+//    }
+//
+//    sensor_debug_print("[LORA] Pushed %d bytes over the air.\r\n", len);
+//}
 void sensor_lora_transmit(uint8_t *payload, uint16_t len)
 {
-    // Bước 1: Kéo M0=0, M1=0 để đưa E32 về chế độ Normal (Truyền nhận)
+    uint32_t t0;
+
     HAL_GPIO_WritePin(LORA_M0_PORT, LORA_M0_PIN, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(LORA_M1_PORT, LORA_M1_PIN, GPIO_PIN_RESET);
 
-    // Bước 2: Chờ module E32 sẵn sàng (AUX bật lên HIGH)
-    while(HAL_GPIO_ReadPin(LORA_AUX_PORT, LORA_AUX_PIN) == GPIO_PIN_RESET) {
-        HAL_IWDG_Refresh(&hiwdg); // Trấn an chó Watchdog
+    t0 = HAL_GetTick();
+    while (HAL_GPIO_ReadPin(LORA_AUX_PORT, LORA_AUX_PIN) == GPIO_PIN_RESET) {
+        if ((HAL_GetTick() - t0) > 2000) {
+            sensor_debug_print("[LORA] AUX timeout before TX\r\n");
+            return;
+        }
     }
 
-    // Bước 3: Đẩy gói tin 15-Byte qua UART vào bộ đệm của E32
     HAL_UART_Transmit(&huart2, payload, len, 100);
 
-    // Bước 4: Chờ E32 phát xong dữ liệu vô tuyến ra không trung (AUX lại lên HIGH)
-    // Cực kỳ quan trọng: Nếu cắt điện ngủ lúc AUX đang LOW, gói tin sẽ rớt giữa chừng!
-    while(HAL_GPIO_ReadPin(LORA_AUX_PORT, LORA_AUX_PIN) == GPIO_PIN_RESET) {
-        HAL_IWDG_Refresh(&hiwdg);
+    t0 = HAL_GetTick();
+    while (HAL_GPIO_ReadPin(LORA_AUX_PORT, LORA_AUX_PIN) == GPIO_PIN_RESET) {
+        if ((HAL_GetTick() - t0) > 2000) {
+            sensor_debug_print("[LORA] AUX timeout after TX\r\n");
+            return;
+        }
     }
 
-    sensor_debug_print("[LORA] Pushed %d bytes over the air.\r\n", len);
+    sensor_debug_print("[LORA] Sent %u bytes\r\n", len);
 }
-
 void sensor_lora_sleep(void)
 {
     // Kéo M0=1, M1=1 để ép E32 vào chế độ Sleep Mode (Dòng rò 2uA)
@@ -79,14 +105,18 @@ uint8_t sht30_iic_deinit(void) { return 0; }
 uint8_t sht30_iic_write_address16(uint8_t addr, uint16_t reg, uint8_t *buf, uint16_t len)
 {
     uint8_t tx[16];
-    if (len > 14) return 1; // SHT30 không bao giờ ghi quá dài
+    if (len > 14) return 1;
 
     tx[0] = (uint8_t)(reg >> 8);
     tx[1] = (uint8_t)(reg & 0xFF);
     if (buf && len > 0) memcpy(&tx[2], buf, len);
 
     HAL_StatusTypeDef s = HAL_I2C_Master_Transmit(&hi2c1, addr, tx, 2 + len, I2C_TIMEOUT_MS);
-    return (s == HAL_OK) ? 0 : 1;
+    if (s != HAL_OK) {
+        sensor_debug_print("SHT30 I2C write fail: status=%d err=0x%08lX\r\n", s, hi2c1.ErrorCode);
+        return 1;
+    }
+    return 0;
 }
 
 uint8_t sht30_iic_read_address16(uint8_t addr, uint16_t reg, uint8_t *buf, uint16_t len)

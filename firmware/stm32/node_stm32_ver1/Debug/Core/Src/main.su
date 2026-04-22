@@ -1,8 +1,5 @@
-../Core/Src/main.c:324:13:MX_I2C1_Init	8	static,ignoring_inline_asm
-../Core/Src/main.c:478:13:MX_USART1_UART_Init	8	static,ignoring_inline_asm
-../Core/Src/main.c:511:13:MX_USART2_UART_Init	8	static,ignoring_inline_asm
-../Core/Src/main.c:89:6:Set_RTC_Alarm_25s	24	static
-../Core/Src/main.c:109:6:Edge_Crypto_Pack	128	static
-../Core/Src/main.c:276:6:SystemClock_Config	96	static,ignoring_inline_asm
-../Core/Src/main.c:143:5:main	64	static,ignoring_inline_asm
-../Core/Src/main.c:596:6:Error_Handler	0	static,ignoring_inline_asm
+../Core/Src/main.c:90:6:Set_RTC_Alarm_25s	24	static
+../Core/Src/main.c:110:6:Edge_Crypto_Pack	128	static
+../Core/Src/main.c:246:6:SystemClock_Config	96	static,ignoring_inline_asm
+../Core/Src/main.c:186:5:main	80	static,ignoring_inline_asm
+../Core/Src/main.c:566:6:Error_Handler	0	static,ignoring_inline_asm

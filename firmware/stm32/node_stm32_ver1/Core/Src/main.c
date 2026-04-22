@@ -25,7 +25,7 @@
 #include "sensor_hal.h"
 #include "api.h"
 #include "crypto_aead.h"
-
+#include "sensors.h"
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -68,6 +68,7 @@ const uint8_t ASCON_SECRET_KEY[16] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
+static uint16_t g_frame_counter = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -134,6 +135,48 @@ void Edge_Crypto_Pack(SensorData_t *raw_data, uint16_t counter, LoRaTxFrame_t *t
     memcpy(tx_frame->ciphertext, &ascon_output[0], 9); // Bốc 9 byte Ciphertext
     memcpy(tx_frame->mac_tag, &ascon_output[9], 4);    // Bốc đúng 4 byte Tag đầu, vứt bỏ 12 byte cuối
 }
+SensorData_t payload;
+LoRaTxFrame_t tx_frame;
+uint8_t init_status;
+static void App_Run_One_Cycle(void)
+{
+
+
+    sensor_debug_print("\r\n[SYS] --- APP CYCLE START ---\r\n");
+
+    /* Nếu PB0 là chân bật nguồn sensor/buck thì kéo lên */
+    HAL_GPIO_WritePin(TPS_SYNC_PORT, TPS_SYNC_PIN, GPIO_PIN_SET);
+    HAL_Delay(10);
+
+    init_status = Sensors_Init_Hardware();
+    sensor_debug_print("[SENSORS] Init status = 0x%02X\r\n", init_status);
+
+    Sensors_Trigger_All();
+    HAL_Delay(130);
+
+    Sensors_Collect_And_Pack(&payload);
+
+    sensor_debug_print("[DATA] env_temp=%d, env_hum=%u, air_press=%u, board_temp=%d, batt=%u, health=0x%02X\r\n",
+                       payload.env_temp,
+                       payload.env_hum,
+                       payload.air_press,
+                       payload.board_temp,
+                       payload.batt_volt,
+                       payload.health_flag);
+
+    Edge_Crypto_Pack(&payload, g_frame_counter, &tx_frame);
+    sensor_debug_print("[ASCON] Encrypted 15-byte frame generated.\r\n");
+
+    sensor_lora_transmit((uint8_t *)&tx_frame, sizeof(tx_frame));
+    sensor_lora_sleep();
+
+    g_frame_counter++;
+
+    /* Tắt rail sensor nếu PB0 đúng là chân nguồn */
+    HAL_GPIO_WritePin(TPS_SYNC_PORT, TPS_SYNC_PIN, GPIO_PIN_RESET);
+
+    sensor_debug_print("[SYS] --- APP CYCLE END ---\r\n");
+}
 /* USER CODE END 0 */
 
 /**
@@ -172,88 +215,14 @@ int main(void)
   MX_USART1_UART_Init();
   MX_RTC_Init();
   /* USER CODE BEGIN 2 */
-  HAL_PWR_EnableBkUpAccess();
-
-    // Xóa cờ Wakeup nếu MCU vừa tỉnh dậy từ Standby
-    if (__HAL_PWR_GET_FLAG(PWR_FLAG_WU) != RESET) {
-        __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
-    }
-    uint16_t wakeup_ticks = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2);
-      /* USER CODE END 2 */
-
-      /* ====================================================================
-       * PHA NGỦ NÔNG (ĐÁ CHÓ VÀ ĐI NGỦ TIẾP) - Chạy 23 lần
-       * ==================================================================== */
-      if (wakeup_ticks < 24)
-      {
-          wakeup_ticks++;
-          HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, wakeup_ticks); // Lưu lại số lần đã thức
-
-          HAL_IWDG_Refresh(&hiwdg);       // Đá chó ngay lập tức
-          Set_RTC_Alarm_25s();            // Đặt báo thức 25s sau kêu tiếp
-
-          HAL_PWR_EnterSTANDBYMode();     // Cắt điện CPU, đi ngủ sâu
+ // HAL_PWR_EnableBkUpAccess();
+  for (uint8_t a = 1; a < 128; a++) {
+      if (HAL_I2C_IsDeviceReady(&hi2c1, a << 1, 2, 50) == HAL_OK) {
+          sensor_debug_print("I2C found: 0x%02X\r\n", a);
       }
+  }
 
-      /* ====================================================================
-       * PHA THỨC SÂU (10 PHÚT ĐÃ ĐẾN) - Đo đạc & Phát sóng
-       * ==================================================================== */
-      else
-      {
-          // 1. Reset bộ đếm gà gật về 0 cho chu kỳ 10 phút tiếp theo
-          HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, 0);
-
-          // 2. ÉP NGUỒN VÀ KHỞI TẠO NGOẠI VI
-          // Kéo chân PS/SYNC của TPS63020 lên HIGH để lấy điện áp 3.3V phẳng lỳ (PWM mode)
-          HAL_GPIO_WritePin(TPS_SYNC_PORT, TPS_SYNC_PIN, GPIO_PIN_SET);
-          sensor_delay_ms(5); // Chờ 5ms cho nguồn điện xả hết nhiễu
-
-          MX_USART1_UART_Init(); // Bật UART1 in Log
-          MX_USART2_UART_Init(); // Bật UART2 nói chuyện LoRa
-          MX_I2C1_Init();        // Bật I2C1 nói chuyện Cảm biến
-
-          sensor_debug_print("\r\n\r\n[SYS] --- 10-MIN CYCLE WAKEUP ---\r\n");
-
-          // 3. THU THẬP DỮ LIỆU (HARDWARE MATH)
-          Sensors_Init_Hardware(); // Khởi tạo mảng cảm biến
-          Sensors_Trigger_All();   // Cấp lệnh Trigger (SHT30 Single-shot, BMP388 Forced)
-
-          // Delay 130ms: Bắt CPU đứng đợi ngoại vi tính toán OSR 16x.
-          // Vì thời gian này ngắn < 26s nên con IWDG vẫn chưa cắn.
-          sensor_delay_ms(130);
-
-          SensorData_t my_payload;
-          Sensors_Collect_And_Pack(&my_payload); // Thu hoạch và ép kiểu về 9-Byte
-
-          // 4. MÃ HÓA ASCON-128a
-          uint16_t current_counter = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1); // Lấy số thứ tự gói tin
-          LoRaTxFrame_t tx_frame;
-          Edge_Crypto_Pack(&my_payload, current_counter, &tx_frame); // Ra lò mảng 15-Byte
-
-          sensor_debug_print("[ASCON] Encrypted 15-Byte frame generated.\r\n");
-
-          // 5. PHÁT SÓNG QUA LORA E32
-          // Hàm này đã tích hợp vòng lặp chờ cờ AUX và đá chó tự động!
-          sensor_lora_transmit((uint8_t*)&tx_frame, sizeof(LoRaTxFrame_t));
-
-          // Ép LoRa đi ngủ ngay lập tức (Dòng tiêu thụ < 2uA)
-          sensor_lora_sleep();
-
-          // 6. DỌN DẸP CHIẾN TRƯỜNG & CHUẨN BỊ NGỦ
-          // Tăng số đếm gói tin để lần sau sinh Nonce mới
-          HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, current_counter + 1);
-
-          // Nhả chân TPS63020 về LOW để ép nguồn chạy chế độ PFM siêu tiết kiệm (30uA)
-          HAL_GPIO_WritePin(TPS_SYNC_PORT, TPS_SYNC_PIN, GPIO_PIN_RESET);
-
-          sensor_debug_print("[SYS] Cycle complete. Entering Standby...\r\n");
-
-          // Lên giường đắp chăn!
-          HAL_IWDG_Refresh(&hiwdg);       // Đá chó lần cuối
-          Set_RTC_Alarm_25s();            // Hẹn giờ gà gật 25s
-          HAL_PWR_EnterSTANDBYMode();     // Cắt điện toàn bộ CPU
-      }
-
+  sensor_debug_print("\r\n[BOOT] Start app without IWDG/RTC\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -263,7 +232,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
+	  App_Run_One_Cycle();
+	          HAL_Delay(1000);
 
   }
   /* USER CODE END 3 */

@@ -68,7 +68,7 @@ uint8_t Sensors_Init_Hardware(void)
     DRIVER_BMP388_LINK_SPI_WRITE(&s_bmp388,        bmp388_spi_write_dummy);
 
     if ((bmp388_set_interface(&s_bmp388, BMP388_INTERFACE_IIC) == 0) &&
-        (bmp388_set_addr_pin(&s_bmp388, BMP388_ADDRESS_ADO_LOW) == 0) &&
+        (bmp388_set_addr_pin(&s_bmp388, BMP388_ADDRESS_ADO_HIGH) == 0) &&
         (bmp388_init(&s_bmp388) == 0))
     {
         // 1. Bật nguồn cho khối cảm biến Nhiệt và Áp suất bên trong chip
