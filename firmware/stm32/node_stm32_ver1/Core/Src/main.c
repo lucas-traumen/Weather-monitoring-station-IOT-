@@ -32,18 +32,39 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef struct __attribute__((packed)) {
-    uint16_t frame_counter;     // 2 Byte: Bộ đếm gói tin (Dùng để sinh Nonce)
-    uint8_t  ciphertext[9];     // 9 Byte: Dữ liệu thời tiết đã bị xáo trộn
-    uint8_t  mac_tag[4];        // 4 Byte: Chữ ký xác thực (Đã chặt đuôi)
+    uint16_t frame_counter;
+    uint8_t  ciphertext[9];
+    uint8_t  mac_tag[4];
 } LoRaTxFrame_t;
+
+typedef char check_sensor_payload_size[(sizeof(SensorData_t) == 9U) ? 1 : -1];
+typedef char check_lora_frame_size[(sizeof(LoRaTxFrame_t) == 15U) ? 1 : -1];
+
+
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define TPS_SYNC_PORT   GPIOA
+#define TPS_SYNC_PIN    GPIO_PIN_6
+
+#define SENSOR_POWER_SETTLE_MS  20U
+#define SENSOR_MEASURE_WAIT_MS  150U
+#define APP_CYCLE_PERIOD_MS     10000U
+
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define TPS_SYNC_PORT   GPIOB
-#define TPS_SYNC_PIN    GPIO_PIN_0
+#define TPS_SYNC_PORT   GPIOA
+#define TPS_SYNC_PIN    GPIO_PIN_6
+
+#define SENSOR_POWER_SETTLE_MS  20U
+#define SENSOR_MEASURE_WAIT_MS  150U
+#define APP_CYCLE_PERIOD_MS     10000U
 
 
+/* USER CODE END PTD */
 
 /* USER CODE END PD */
 
@@ -64,11 +85,12 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-const uint8_t ASCON_SECRET_KEY[16] = {
+static const uint8_t ASCON_SECRET_KEY[16] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
-static uint16_t g_frame_counter = 0;
+
+static uint16_t g_frame_counter = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -86,97 +108,104 @@ static void MX_RTC_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/* ─── HÀM CÀI ĐẶT BÁO THỨC RTC (25 GIÂY) ─────────────────────────────────── */
-void Set_RTC_Alarm_25s(void)
+static void debug_dump_hex(const char *prefix, const uint8_t *data, uint16_t len)
 {
-    RTC_TimeTypeDef sTime = {0};
-    RTC_AlarmTypeDef sAlarm = {0};
+    uint16_t i;
 
-    // Đọc thời gian hiện tại
-    HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
-
-    // Tính toán số giây cho báo thức (Xử lý tràn 60 giây)
-    uint8_t target_sec = sTime.Seconds + 25;
-    if (target_sec >= 60) {
-        target_sec -= 60;
+    if ((prefix == NULL) || (data == NULL)) {
+        return;
     }
 
-    sAlarm.AlarmTime.Seconds = target_sec;
-    sAlarm.Alarm = RTC_ALARM_A;
-    HAL_RTC_SetAlarm_IT(&hrtc, &sAlarm, RTC_FORMAT_BIN);
+    sensor_debug_print("%s (%uB):", prefix, (unsigned)len);
+    for (i = 0U; i < len; i++) {
+        sensor_debug_print(" %02X", data[i]);
+    }
+    sensor_debug_print("\r\n");
 }
 
-/* ─── HÀM MÃ HÓA VÀ CẮT GỌT ASCON-128a ───────────────────────────────────── */
-void Edge_Crypto_Pack(SensorData_t *raw_data, uint16_t counter, LoRaTxFrame_t *tx_frame)
+static void Edge_Crypto_Pack(const SensorData_t *raw_data, uint16_t counter, LoRaTxFrame_t *tx_frame)
 {
     uint8_t plaintext[9];
-    memcpy(plaintext, raw_data, 9); // Ép struct 9-byte sang mảng byte
-
-    uint8_t ascon_output[25];       // Chứa 9-Byte Cipher + 16-Byte Tag
-    unsigned long long clen = 0;
-
-    // Sinh Nonce ngẫu nhiên (16 Byte). Dùng Frame Counter đắp vào 2 byte đầu
+    uint8_t ascon_output[25];
     uint8_t nonce[16] = {0};
-    nonce[0] = (uint8_t)(counter >> 8);
-    nonce[1] = (uint8_t)(counter & 0xFF);
+    unsigned long long clen = 0ULL;
+    int ret;
 
-    // Bơm vào lò luyện ASCON
-    crypto_aead_encrypt(
+    if ((raw_data == NULL) || (tx_frame == NULL)) {
+        return;
+    }
+
+    memcpy(plaintext, raw_data, sizeof(plaintext));
+
+    nonce[0] = (uint8_t)(counter >> 8);
+    nonce[1] = (uint8_t)(counter & 0xFFU);
+    nonce[2] = 0x57U;
+    nonce[3] = 0x53U;
+    nonce[4] = 0x4EU;
+    nonce[5] = 0x31U;
+
+    ret = crypto_aead_encrypt(
         ascon_output, &clen,
-        plaintext, 9,           // Dữ liệu mộc
-        NULL, 0,                // Không dùng Associated Data
-        NULL,                   // Không dùng Secret Nonce
-        nonce,                  // Public Nonce 16-byte
-        ASCON_SECRET_KEY        // Khóa bí mật
+        plaintext, sizeof(plaintext),
+        NULL, 0,
+        NULL,
+        nonce,
+        ASCON_SECRET_KEY
     );
 
-    // [TRUNCATION] Đóng gói vào Frame 15-Byte bay qua LoRa
+    if ((ret != 0) || (clen < 13ULL)) {
+        memset(tx_frame, 0, sizeof(*tx_frame));
+        sensor_debug_print("[ASCON] Encrypt FAILED\r\n");
+        return;
+    }
+
     tx_frame->frame_counter = counter;
-    memcpy(tx_frame->ciphertext, &ascon_output[0], 9); // Bốc 9 byte Ciphertext
-    memcpy(tx_frame->mac_tag, &ascon_output[9], 4);    // Bốc đúng 4 byte Tag đầu, vứt bỏ 12 byte cuối
+    memcpy(tx_frame->ciphertext, &ascon_output[0], sizeof(tx_frame->ciphertext));
+    memcpy(tx_frame->mac_tag, &ascon_output[9], sizeof(tx_frame->mac_tag));
 }
+
+uint8_t init_status;
+uint8_t tx_ok;
 SensorData_t payload;
 LoRaTxFrame_t tx_frame;
-uint8_t init_status;
+
 static void App_Run_One_Cycle(void)
 {
 
 
-    sensor_debug_print("\r\n[SYS] --- APP CYCLE START ---\r\n");
+    memset(&payload, 0, sizeof(payload));
+    memset(&tx_frame, 0, sizeof(tx_frame));
 
-    /* Nếu PB0 là chân bật nguồn sensor/buck thì kéo lên */
-    HAL_GPIO_WritePin(TPS_SYNC_PORT, TPS_SYNC_PIN, GPIO_PIN_SET);
-    HAL_Delay(10);
+    sensor_debug_print("\r\n[SYS] ===== APP CYCLE START =====\r\n");
+
+    //HAL_GPIO_WritePin(TPS_SYNC_GPIO_Port, TPS_SYNC_Pin, GPIO_PIN_SET);
+    HAL_Delay(SENSOR_POWER_SETTLE_MS);
 
     init_status = Sensors_Init_Hardware();
     sensor_debug_print("[SENSORS] Init status = 0x%02X\r\n", init_status);
 
     Sensors_Trigger_All();
-    HAL_Delay(130);
+    HAL_Delay(SENSOR_MEASURE_WAIT_MS);
 
     Sensors_Collect_And_Pack(&payload);
-
-    sensor_debug_print("[DATA] env_temp=%d, env_hum=%u, air_press=%u, board_temp=%d, batt=%u, health=0x%02X\r\n",
-                       payload.env_temp,
-                       payload.env_hum,
-                       payload.air_press,
-                       payload.board_temp,
-                       payload.batt_volt,
-                       payload.health_flag);
+    debug_dump_hex("[PAYLOAD]", (const uint8_t *)&payload, sizeof(payload));
 
     Edge_Crypto_Pack(&payload, g_frame_counter, &tx_frame);
-    sensor_debug_print("[ASCON] Encrypted 15-byte frame generated.\r\n");
+    debug_dump_hex("[FRAME]", (const uint8_t *)&tx_frame, sizeof(tx_frame));
 
-    sensor_lora_transmit((uint8_t *)&tx_frame, sizeof(tx_frame));
+    tx_ok = sensor_lora_transmit((const uint8_t *)&tx_frame, sizeof(tx_frame));
+    if (tx_ok != SENSOR_OK) {
+        sensor_debug_print("[SYS] LoRa TX FAILED for frame=%u\r\n", g_frame_counter);
+    }
+
     sensor_lora_sleep();
+    //HAL_GPIO_WritePin(TPS_SYNC_GPIO_Port, TPS_SYNC_Pin, GPIO_PIN_RESET);
 
     g_frame_counter++;
 
-    /* Tắt rail sensor nếu PB0 đúng là chân nguồn */
-    HAL_GPIO_WritePin(TPS_SYNC_PORT, TPS_SYNC_PIN, GPIO_PIN_RESET);
-
-    sensor_debug_print("[SYS] --- APP CYCLE END ---\r\n");
+    sensor_debug_print("[SYS] ===== APP CYCLE END =====\r\n");
 }
+
 /* USER CODE END 0 */
 
 /**
@@ -215,14 +244,22 @@ int main(void)
   MX_USART1_UART_Init();
   MX_RTC_Init();
   /* USER CODE BEGIN 2 */
- // HAL_PWR_EnableBkUpAccess();
-  for (uint8_t a = 1; a < 128; a++) {
-      if (HAL_I2C_IsDeviceReady(&hi2c1, a << 1, 2, 50) == HAL_OK) {
-          sensor_debug_print("I2C found: 0x%02X\r\n", a);
-      }
-  }
+  uint8_t lora_cfg[6];
 
-  sensor_debug_print("\r\n[BOOT] Start app without IWDG/RTC\r\n");
+       if (sensor_lora_write_default_config() != SENSOR_OK) {
+           sensor_debug_print("[SYS] E32 config write FAILED\r\n");
+       } else {
+           sensor_debug_print("[SYS] E32 config write OK\r\n");
+
+           if (sensor_lora_read_config(lora_cfg) == SENSOR_OK) {
+               debug_dump_hex("[LORA_CFG]", lora_cfg, sizeof(lora_cfg));
+           } else {
+               sensor_debug_print("[SYS] E32 config read FAILED\r\n");
+           }
+       }
+
+       /* để module ngủ chờ chu kỳ đầu tiên */
+       sensor_lora_sleep();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -233,7 +270,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 	  App_Run_One_Cycle();
-	          HAL_Delay(1000);
+	  HAL_Delay(APP_CYCLE_PERIOD_MS);
 
   }
   /* USER CODE END 3 */

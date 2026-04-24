@@ -161,4 +161,8 @@ $<TARGET_FILE:idf::touch_element>
 $<TARGET_FILE:idf::usb>
 $<TARGET_FILE:idf::wifi_provisioning>
 $<TARGET_FILE:__idf_json>
+$<TARGET_FILE:idf::ascon>
+$<TARGET_FILE:idf::lora_e32>
 $<TARGET_FILE:idf::main>
+$<TARGET_FILE:__idf_ascon>
+$<TARGET_FILE:__idf_lora_e32>

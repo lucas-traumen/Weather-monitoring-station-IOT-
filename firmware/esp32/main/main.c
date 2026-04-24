@@ -1,187 +1,418 @@
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
+
 #include "driver/gpio.h"
-#include "esp_timer.h"
+#include "driver/uart.h"
+#include "esp_err.h"
 #include "esp_log.h"
-#include "esp_wifi.h"
-#include "nvs_flash.h"
-#include "esp_event.h"
+#include "esp_timer.h"
 
-#include "min.h" // Thư viện MIN Protocol
+#include "Lora.h"
 
-static const char *TAG = "GATEWAY_MIN";
+/* =========================
+ * PIN MAP
+ * ========================= */
+#define LORA_UART_NUM          UART_NUM_2
+#define LORA_UART_TX_PIN       GPIO_NUM_17
+#define LORA_UART_RX_PIN       GPIO_NUM_18
 
-/* ─── CẤU HÌNH UART ─── */
-#define UART_PORT_NUM      UART_NUM_1
-#define UART_BAUD_RATE     115200
-#define UART_TX_PIN        17  // Nối với RX của STM32
-#define UART_RX_PIN        18  // Nối với TX của STM32
+#define LORA_M0_PIN            GPIO_NUM_37
+#define LORA_M1_PIN            GPIO_NUM_38
+#define LORA_AUX_PIN           GPIO_NUM_39
 
-#define MIN_ID_TELEMETRY   0x01
+/* =========================
+ * BAUD
+ * =========================
+ * E32 config mode: 9600
+ * E32 run mode:    115200 (khớp với STM32 node hiện tại)
+ */
+#define LORA_CFG_BAUDRATE      9600
+#define LORA_RUN_BAUDRATE      115200
 
-/* Khai báo Context cho MIN */
-struct min_context min_ctx;
+/* =========================
+ * FRAME / BUFFER
+ * ========================= */
+#define UART_BUF_SIZE          256
+#define FRAME_SIZE             15
+#define BURST_BUF_SIZE         64
+#define BURST_GAP_MS           20
 
-/* ══════════════════════════════════════════════════════════════════════════
- * 1. KẾT NỐI WI-FI (STATION MODE)
- * ══════════════════════════════════════════════════════════════════════════ */
-#define WIFI_SSID      "LUCAS" // Bác nhớ điền tên WiFi
-#define WIFI_PASS      "12345678"    // Và mật khẩu vào đây nhé
+/* =========================
+ * APP MODE
+ * =========================
+ * 0 = normal E32 receive
+ * 1 = UART2 basic test
+ * 2 = UART2 loopback test (cần nối tạm TX17 -> RX18)
+ * 3 = UART2 RX activity watch
+ */
+#define APP_MODE_NORMAL_RX     0
+#define APP_MODE_UART_BASIC    1
+#define APP_MODE_UART_LOOPBACK 2
+#define APP_MODE_UART_RX_WATCH 3
 
+#define APP_MODE               APP_MODE_NORMAL_RX
 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+static const char *TAG = "E32_TEST";
+
+typedef struct {
+    uart_port_t uart_num;
+} app_ctx_t;
+
+static app_ctx_t g_ctx = {
+    .uart_num = LORA_UART_NUM
+};
+
+static void check_e32(int ret, const char *where)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-        ESP_LOGI("WIFI", "Đang kết nối đến AP...");
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        esp_wifi_connect();
-        ESP_LOGW("WIFI", "Mất kết nối, đang thử lại...");
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI("WIFI", "KẾT NỐI THÀNH CÔNG! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    if (ret != E32_OK) {
+        ESP_LOGE(TAG, "%s failed, ret=%d", where, ret);
+        abort();
     }
 }
 
-void wifi_init_sta(void)
+static int port_uart_write(void *user, const uint8_t *data, size_t len)
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
-    ESP_ERROR_CHECK(esp_wifi_start() );
+    app_ctx_t *ctx = (app_ctx_t *)user;
+    return uart_write_bytes(ctx->uart_num, data, len);
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
- * 2. CÁC HÀM XỬ LÝ MIN PROTOCOL
- * ══════════════════════════════════════════════════════════════════════════ */
-uint32_t min_time_ms(void) {
+static int port_uart_read(void *user, uint8_t *data, size_t len, uint32_t timeout_ms)
+{
+    app_ctx_t *ctx = (app_ctx_t *)user;
+    return uart_read_bytes(ctx->uart_num, data, len, pdMS_TO_TICKS(timeout_ms));
+}
+
+static void port_set_m0(void *user, int level)
+{
+    (void)user;
+    gpio_set_level((gpio_num_t)LORA_M0_PIN, level);
+}
+
+static void port_set_m1(void *user, int level)
+{
+    (void)user;
+    gpio_set_level((gpio_num_t)LORA_M1_PIN, level);
+}
+
+static int port_get_aux(void *user)
+{
+    (void)user;
+    return gpio_get_level((gpio_num_t)LORA_AUX_PIN);
+}
+
+static void port_delay_ms(void *user, uint32_t ms)
+{
+    (void)user;
+    vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
+static uint32_t port_tick_ms(void *user)
+{
+    (void)user;
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-uint16_t min_tx_space(uint8_t port) { return 512; }
-
-void min_tx_byte(uint8_t port, uint8_t byte) {
-    uart_write_bytes(UART_PORT_NUM, (const char *)&byte, 1);
-}
-
-void min_tx_start(uint8_t port) { }
-void min_tx_finished(uint8_t port) { }
-
-/* Hàm giải mã cục data 13 bytes từ STM32 */
-void min_application_handler(uint8_t min_id, uint8_t const *min_payload, uint8_t len_payload, uint8_t port) 
+static void dump_hex(const char *prefix, const uint8_t *data, size_t len)
 {
-    if (min_id == MIN_ID_TELEMETRY && len_payload == 13) {
-        uint8_t idx = 0;
-        
-        int16_t t_out_raw = (min_payload[idx] << 8) | min_payload[idx+1]; idx += 2;
-        float temp_out = t_out_raw / 100.0f;
-
-        uint16_t h_out_raw = (min_payload[idx] << 8) | min_payload[idx+1]; idx += 2;
-        float hum_out = h_out_raw / 100.0f;
-
-        int16_t t_board_raw = (min_payload[idx] << 8) | min_payload[idx+1]; idx += 2;
-        float temp_board = t_board_raw / 100.0f;
-
-        uint32_t press_raw = (min_payload[idx] << 24) | (min_payload[idx+1] << 16) | 
-                             (min_payload[idx+2] << 8)  | min_payload[idx+3]; idx += 4;
-        float pressure = press_raw / 100.0f;
-
-        int16_t alt_raw = (min_payload[idx] << 8) | min_payload[idx+1]; idx += 2;
-        float altitude = alt_raw / 10.0f;
-
-        uint8_t battery = min_payload[idx];
-
-        ESP_LOGI(TAG, "Môi trường: %.2f °C | %.2f %%RH", temp_out, hum_out);
-        ESP_LOGI(TAG, "Bo mạch   : %.2f °C | %.2f hPa | %.1f m", temp_board, pressure, altitude);
-        ESP_LOGI(TAG, "Pin       : %d %%", battery);
-        ESP_LOGI(TAG, "-----------------------------------");
+    printf("%s", prefix);
+    for (size_t i = 0; i < len; i++) {
+        printf(" %02X", data[i]);
     }
+    printf("\n");
 }
 
-/* Task ngầm chạy song song để hứng dữ liệu UART */
-static void uart_rx_task(void *arg)
+static void uart_lora_gpio_init(void)
 {
-    uint8_t rx_buf[128];
-    while (1) {
-        int rx_bytes = uart_read_bytes(UART_PORT_NUM, rx_buf, sizeof(rx_buf), 20 / portTICK_PERIOD_MS);
-        if (rx_bytes > 0) {
-            min_poll(&min_ctx, rx_buf, (uint32_t)rx_bytes);
-        } else {
-            min_poll(&min_ctx, NULL, 0);
-        }
-    }
+    gpio_config_t io_m0 = {
+        .pin_bit_mask = (1ULL << LORA_M0_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_m0));
+
+    gpio_config_t io_m1 = {
+        .pin_bit_mask = (1ULL << LORA_M1_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_m1));
+
+    gpio_config_t io_aux = {
+        .pin_bit_mask = (1ULL << LORA_AUX_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_aux));
 }
-#ifdef MIN_DEBUG_PRINTING
-void min_debug_print(const char *msg, ...)
+
+static void uart_lora_driver_init(uint32_t baudrate)
 {
-    char buf[256]; // Bộ đệm tạm để chứa chuỗi
-    va_list args;
-
-    /* 1. Gom tất cả các tham số (..., %d, %f) lại thành một chuỗi hoàn chỉnh */
-    va_start(args, msg);
-    vsnprintf(buf, sizeof(buf), msg, args);
-    va_end(args);
-
-    /* 2. Nhét thêm chữ [MIN] vào trước để dễ phân biệt, rồi đẩy vào kho DMA */
-	ESP_LOGW("MIN_CORE", " %s",buf);
-}
-#endif
-/* ══════════════════════════════════════════════════════════════════════════
- * 3. HÀM MAIN (CHỈ CHẠY 1 LẦN LÚC CẤP NGUỒN)
- * ══════════════════════════════════════════════════════════════════════════ */
-void app_main(void)
-{
-    ESP_LOGI(TAG, "Khởi động Gateway ESP32-S3...");
-
-    /* 0. Khởi tạo bộ nhớ Flash (Bắt buộc phải làm trước khi gọi Wi-Fi) */
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    /* 1. Khởi tạo và kết nối Wi-Fi */
-    wifi_init_sta();
-
-    /* 2. Cấu hình phần cứng UART */
-    uart_config_t uart_config = {
-        .baud_rate = UART_BAUD_RATE,
+    const uart_config_t cfg = {
+        .baud_rate = (int)baudrate,
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, 1024 * 2, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    /* 3. Khởi tạo bộ đệm MIN và phóng Task đọc UART */
-    min_init_context(&min_ctx, 0);
-    xTaskCreate(uart_rx_task, "uart_rx_task", 4096, NULL, 10, NULL);
+    ESP_ERROR_CHECK(uart_driver_install(LORA_UART_NUM, UART_BUF_SIZE, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(LORA_UART_NUM, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(
+        LORA_UART_NUM,
+        LORA_UART_TX_PIN,
+        LORA_UART_RX_PIN,
+        UART_PIN_NO_CHANGE,
+        UART_PIN_NO_CHANGE
+    ));
 
-    /* 4. Vòng lặp duy trì hệ thống */
-    while (true) {
-        // Mọi thứ đã được các Task và ngắt xử lý, hàm main chỉ cần ngủ để nhường CPU
-        vTaskDelay(pdMS_TO_TICKS(10000)); // Ngủ 10 giây
+    /* Giữ RX sạch mức idle */
+    ESP_ERROR_CHECK(gpio_set_pull_mode(LORA_UART_RX_PIN, GPIO_PULLUP_ONLY));
+}
+
+static void uart_lora_set_baud(uint32_t baudrate)
+{
+    ESP_ERROR_CHECK(uart_set_baudrate(LORA_UART_NUM, baudrate));
+    uart_flush(LORA_UART_NUM);
+}
+
+/* =========================
+ * UART2 CHECK FUNCTIONS
+ * ========================= */
+static void uart2_check_basic(void)
+{
+    uint32_t baud = 0;
+    size_t buffered = 0;
+    const char *msg = "UART2_BASIC_TEST\r\n";
+    int wr;
+
+    ESP_ERROR_CHECK(uart_get_baudrate(LORA_UART_NUM, &baud));
+    ESP_LOGI(TAG, "[UART2] baud=%" PRIu32, baud);
+
+    ESP_ERROR_CHECK(uart_get_buffered_data_len(LORA_UART_NUM, &buffered));
+    ESP_LOGI(TAG, "[UART2] buffered before tx=%u", (unsigned)buffered);
+
+    wr = uart_write_bytes(LORA_UART_NUM, msg, strlen(msg));
+    if (wr < 0) {
+        ESP_LOGE(TAG, "[UART2] uart_write_bytes failed");
+        return;
+    }
+
+    ESP_LOGI(TAG, "[UART2] wrote %d bytes", wr);
+    ESP_ERROR_CHECK(uart_wait_tx_done(LORA_UART_NUM, pdMS_TO_TICKS(200)));
+    ESP_LOGI(TAG, "[UART2] tx done");
+}
+
+static void uart2_check_loopback(void)
+{
+    static const uint8_t pattern[] = {
+        0x55, 0xAA, 0x00, 0x11, 0x22, 0x33, 0x5A, 0xA5
+    };
+    uint8_t rx[sizeof(pattern)] = {0};
+    int wr, rd;
+
+    ESP_LOGI(TAG, "[UART2] loopback test start");
+    ESP_LOGI(TAG, "[UART2] jumper required: TX%d -> RX%d",
+             LORA_UART_TX_PIN, LORA_UART_RX_PIN);
+
+    uart_flush(LORA_UART_NUM);
+    uart_flush_input(LORA_UART_NUM);
+
+    wr = uart_write_bytes(LORA_UART_NUM, pattern, sizeof(pattern));
+    if (wr != (int)sizeof(pattern)) {
+        ESP_LOGE(TAG, "[UART2] loopback write failed, wr=%d", wr);
+        return;
+    }
+
+    ESP_ERROR_CHECK(uart_wait_tx_done(LORA_UART_NUM, pdMS_TO_TICKS(200)));
+
+    rd = uart_read_bytes(LORA_UART_NUM, rx, sizeof(rx), pdMS_TO_TICKS(200));
+    ESP_LOGI(TAG, "[UART2] loopback read %d bytes", rd);
+
+    dump_hex("[UART2_TX]", pattern, sizeof(pattern));
+    dump_hex("[UART2_RX]", rx, (rd > 0) ? (size_t)rd : 0);
+
+    if ((rd == (int)sizeof(pattern)) && (memcmp(pattern, rx, sizeof(pattern)) == 0)) {
+        ESP_LOGI(TAG, "[UART2] loopback PASS");
+    } else {
+        ESP_LOGW(TAG, "[UART2] loopback FAIL");
     }
 }
+
+static void uart2_check_rx_activity(uint32_t watch_ms)
+{
+    uint8_t buf[64];
+    uint32_t start = port_tick_ms(NULL);
+
+    ESP_LOGI(TAG, "[UART2] watch RX for %" PRIu32 " ms", watch_ms);
+
+    while ((port_tick_ms(NULL) - start) < watch_ms) {
+        int rd = uart_read_bytes(LORA_UART_NUM, buf, sizeof(buf), pdMS_TO_TICKS(20));
+        if (rd > 0) {
+            ESP_LOGI(TAG, "[UART2] rx activity: %d bytes", rd);
+            dump_hex("[UART2_RX_ACTIVITY]", buf, (size_t)rd);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    ESP_LOGI(TAG, "[UART2] watch done");
+}
+
+/* =========================
+ * E32 NORMAL RX
+ * ========================= */
+static void process_burst(const uint8_t *buf, size_t len)
+{
+    if (len == 0) {
+        return;
+    }
+
+    if (len != FRAME_SIZE) {
+        ESP_LOGW(TAG, "drop burst len=%u", (unsigned)len);
+        dump_hex("[DROP]", buf, len);
+        return;
+    }
+
+    /* STM32F1 gửi raw struct little-endian */
+    uint16_t counter = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+
+    ESP_LOGI(TAG, "frame_counter=%u", counter);
+    dump_hex("[FRAME]", buf, len);
+}
+
+static void run_normal_rx(void)
+{
+    e32_t radio;
+    e32_io_t io = {
+        .user       = &g_ctx,
+        .uart_write = port_uart_write,
+        .uart_read  = port_uart_read,
+        .set_m0     = port_set_m0,
+        .set_m1     = port_set_m1,
+        .get_aux    = port_get_aux,
+        .delay_ms   = port_delay_ms,
+        .tick_ms    = port_tick_ms,
+    };
+
+    /* Match với node STM32:
+       ADDR  = 0x0017
+       SPEED = 0x3A = 115200, 8N1, 2.4Kbps
+       CHAN  = 0x17
+       OPT   = 0x44 = transparent, push-pull, 250ms, FEC on */
+    e32_config_t cfg = {
+        .addh = 0x00,
+        .addl = 0x17,
+        .speed = E32_UART_8N1 | E32_BAUD_115200 | E32_AIR_24K,
+        .chan = 0x17,
+        .option = E32_TRANS_TRANSPARENT |
+                  E32_IO_PUSH_PULL |
+                  E32_WAKE_250MS |
+                  E32_FEC_ON |
+                  E32_PWR_30DBM
+    };
+
+    uint8_t rx_chunk[32];
+    uint8_t burst_buf[BURST_BUF_SIZE];
+    size_t burst_pos = 0;
+    uint32_t last_rx_ms = 0;
+
+    /* Step 1: config baud 9600 */
+    uart_lora_driver_init(LORA_CFG_BAUDRATE);
+    uart_flush(LORA_UART_NUM);
+
+    check_e32(e32_init(&radio, &io, 2000), "e32_init");
+
+    ESP_LOGI(TAG, "CFG UART%d @ %d | TX=%d RX=%d | M0=%d M1=%d AUX=%d",
+             LORA_UART_NUM, LORA_CFG_BAUDRATE,
+             LORA_UART_TX_PIN, LORA_UART_RX_PIN,
+             LORA_M0_PIN, LORA_M1_PIN, LORA_AUX_PIN);
+
+    /* Step 2: write config to E32 */
+    check_e32(e32_write_config(&radio, E32_CFG_SAVE_TO_FLASH, &cfg), "e32_write_config");
+
+    /* Step 3: switch local UART to run baud */
+    uart_lora_set_baud(LORA_RUN_BAUDRATE);
+
+    /* Step 4: ensure E32 back to normal mode */
+    check_e32(e32_enter_normal(&radio), "e32_enter_normal");
+
+    uart_flush(LORA_UART_NUM);
+    ESP_LOGI(TAG, "RUN UART%d @ %d", LORA_UART_NUM, LORA_RUN_BAUDRATE);
+    ESP_LOGI(TAG, "E32 ready, waiting frames...");
+
+    while (1) {
+        int rd = e32_read_raw(&radio, rx_chunk, sizeof(rx_chunk), 10);
+        uint32_t now_ms = port_tick_ms(NULL);
+
+        if (rd > 0) {
+            if ((burst_pos > 0) && ((now_ms - last_rx_ms) > BURST_GAP_MS)) {
+                process_burst(burst_buf, burst_pos);
+                burst_pos = 0;
+            }
+
+            last_rx_ms = now_ms;
+
+            for (int i = 0; i < rd; i++) {
+                if (burst_pos < sizeof(burst_buf)) {
+                    burst_buf[burst_pos++] = rx_chunk[i];
+                } else {
+                    ESP_LOGW(TAG, "overflow burst, drop");
+                    dump_hex("[OVERFLOW]", burst_buf, burst_pos);
+                    burst_pos = 0;
+                    break;
+                }
+            }
+        } else {
+            if ((burst_pos > 0) && ((now_ms - last_rx_ms) > BURST_GAP_MS)) {
+                process_burst(burst_buf, burst_pos);
+                burst_pos = 0;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+void app_main(void)
+{
+    uart_lora_gpio_init();
+
+#if APP_MODE == APP_MODE_UART_BASIC
+    uart_lora_driver_init(LORA_RUN_BAUDRATE);
+    ESP_LOGI(TAG, "UART2 BASIC TEST | TX=%d RX=%d", LORA_UART_TX_PIN, LORA_UART_RX_PIN);
+    uart2_check_basic();
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+#elif APP_MODE == APP_MODE_UART_LOOPBACK
+    uart_lora_driver_init(LORA_RUN_BAUDRATE);
+    ESP_LOGI(TAG, "UART2 LOOPBACK TEST | TX=%d RX=%d", LORA_UART_TX_PIN, LORA_UART_RX_PIN);
+    uart2_check_loopback();
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+#elif APP_MODE == APP_MODE_UART_RX_WATCH
+    uart_lora_driver_init(LORA_RUN_BAUDRATE);
+    ESP_LOGI(TAG, "UART2 RX WATCH | TX=%d RX=%d", LORA_UART_TX_PIN, LORA_UART_RX_PIN);
+    while (1) {
+        uart2_check_rx_activity(3000);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+#else
+    run_normal_rx();
+#endif
+}
+

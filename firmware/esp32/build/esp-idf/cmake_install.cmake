@@ -569,6 +569,16 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
+  include("D:/Github/Course-Project-1/firmware/esp32/build/esp-idf/ascon/cmake_install.cmake")
+endif()
+
+if(NOT CMAKE_INSTALL_LOCAL_ONLY)
+  # Include the install script for the subdirectory.
+  include("D:/Github/Course-Project-1/firmware/esp32/build/esp-idf/lora_e32/cmake_install.cmake")
+endif()
+
+if(NOT CMAKE_INSTALL_LOCAL_ONLY)
+  # Include the install script for the subdirectory.
   include("D:/Github/Course-Project-1/firmware/esp32/build/esp-idf/main/cmake_install.cmake")
 endif()
 

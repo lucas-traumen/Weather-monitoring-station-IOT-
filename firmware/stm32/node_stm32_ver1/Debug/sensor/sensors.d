@@ -26,7 +26,7 @@ sensor/sensors.o: ../sensor/sensors.c ../sensor/sensors.h \
  ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rtc.h \
  ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rtc_ex.h \
  ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h \
- ../sensor/sensor_hal.h \
+ ../sensor/sensor_hal.h ../Core/Inc/main.h \
  D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sht30/driver_sht30.h \
  D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/bmp388/driver_bmp388.h
 ../sensor/sensors.h:
@@ -58,5 +58,6 @@ sensor/sensors.o: ../sensor/sensors.c ../sensor/sensors.h \
 ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rtc_ex.h:
 ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h:
 ../sensor/sensor_hal.h:
+../Core/Inc/main.h:
 D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sht30/driver_sht30.h:
 D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/bmp388/driver_bmp388.h:

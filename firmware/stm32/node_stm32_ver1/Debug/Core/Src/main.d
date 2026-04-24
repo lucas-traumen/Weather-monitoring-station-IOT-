@@ -27,7 +27,6 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rtc_ex.h \
  ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h \
  D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sensor_hal.h \
- D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sensors.h \
  D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/ascon/api.h \
  D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/ascon/crypto_aead.h \
  D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sensors.h
@@ -60,7 +59,6 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rtc_ex.h:
 ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h:
 D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sensor_hal.h:
-D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sensors.h:
 D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/ascon/api.h:
 D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/ascon/crypto_aead.h:
 D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sensors.h:
