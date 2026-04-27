@@ -11,6 +11,7 @@
 extern I2C_HandleTypeDef  hi2c1;
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
+extern IWDG_HandleTypeDef hiwdg;
 
 #define LORA_UART_CFG_BAUD      9600U
 #define LORA_UART_RUN_BAUD      115200U
@@ -35,6 +36,8 @@ static uint8_t sensor_lora_wait_aux_high(uint32_t timeout_ms)
     uint32_t t0 = HAL_GetTick();
 
     while (HAL_GPIO_ReadPin(LORA_AUX_PORT, LORA_AUX_PIN) == GPIO_PIN_RESET) {
+        HAL_IWDG_Refresh(&hiwdg);
+
         if ((HAL_GetTick() - t0) >= timeout_ms) {
             return SENSOR_ERR;
         }

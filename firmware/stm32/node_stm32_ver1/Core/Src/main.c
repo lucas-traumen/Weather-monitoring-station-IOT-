@@ -122,8 +122,27 @@ static void debug_dump_hex(const char *prefix, const uint8_t *data, uint16_t len
     }
     sensor_debug_print("\r\n");
 }
+static void App_Delay_With_Watchdog(uint32_t ms)
+{
+    uint32_t start = HAL_GetTick();
 
-static void Edge_Crypto_Pack(const SensorData_t *raw_data, uint16_t counter, LoRaTxFrame_t *tx_frame)
+    while ((HAL_GetTick() - start) < ms) {
+        HAL_IWDG_Refresh(&hiwdg);
+        HAL_Delay(50);
+    }
+}
+static uint8_t lora_cfg_is_target(const uint8_t cfg[6])
+{
+    return (cfg[0] == 0xC0 &&
+            cfg[1] == 0x00 &&
+            cfg[2] == 0x17 &&
+            cfg[3] == 0x3A &&
+            cfg[4] == 0x17 &&
+            cfg[5] == 0x44);
+}
+static uint8_t Edge_Crypto_Pack(const SensorData_t *raw_data,
+                                uint16_t counter,
+                                LoRaTxFrame_t *tx_frame)
 {
     uint8_t plaintext[9];
     uint8_t ascon_output[25];
@@ -132,9 +151,10 @@ static void Edge_Crypto_Pack(const SensorData_t *raw_data, uint16_t counter, LoR
     int ret;
 
     if ((raw_data == NULL) || (tx_frame == NULL)) {
-        return;
+        return SENSOR_ERR;
     }
 
+    memset(tx_frame, 0, sizeof(*tx_frame));
     memcpy(plaintext, raw_data, sizeof(plaintext));
 
     nonce[0] = (uint8_t)(counter >> 8);
@@ -154,16 +174,16 @@ static void Edge_Crypto_Pack(const SensorData_t *raw_data, uint16_t counter, LoR
     );
 
     if ((ret != 0) || (clen < 13ULL)) {
-        memset(tx_frame, 0, sizeof(*tx_frame));
-        sensor_debug_print("[ASCON] Encrypt FAILED\r\n");
-        return;
+        sensor_debug_print("[ASCON] Encrypt FAILED, skip TX\r\n");
+        return SENSOR_ERR;
     }
 
     tx_frame->frame_counter = counter;
     memcpy(tx_frame->ciphertext, &ascon_output[0], sizeof(tx_frame->ciphertext));
     memcpy(tx_frame->mac_tag, &ascon_output[9], sizeof(tx_frame->mac_tag));
-}
 
+    return SENSOR_OK;
+}
 uint8_t init_status;
 uint8_t tx_ok;
 SensorData_t payload;
@@ -176,36 +196,46 @@ static void App_Run_One_Cycle(void)
     memset(&payload, 0, sizeof(payload));
     memset(&tx_frame, 0, sizeof(tx_frame));
 
+    HAL_IWDG_Refresh(&hiwdg);
+
     sensor_debug_print("\r\n[SYS] ===== APP CYCLE START =====\r\n");
 
-    //HAL_GPIO_WritePin(TPS_SYNC_GPIO_Port, TPS_SYNC_Pin, GPIO_PIN_SET);
-    HAL_Delay(SENSOR_POWER_SETTLE_MS);
+    App_Delay_With_Watchdog(SENSOR_POWER_SETTLE_MS);
 
     init_status = Sensors_Init_Hardware();
     sensor_debug_print("[SENSORS] Init status = 0x%02X\r\n", init_status);
 
+    HAL_IWDG_Refresh(&hiwdg);
+
     Sensors_Trigger_All();
-    HAL_Delay(SENSOR_MEASURE_WAIT_MS);
+    App_Delay_With_Watchdog(SENSOR_MEASURE_WAIT_MS);
 
     Sensors_Collect_And_Pack(&payload);
     debug_dump_hex("[PAYLOAD]", (const uint8_t *)&payload, sizeof(payload));
 
-    Edge_Crypto_Pack(&payload, g_frame_counter, &tx_frame);
+    if (Edge_Crypto_Pack(&payload, g_frame_counter, &tx_frame) != SENSOR_OK) {
+        sensor_debug_print("[SYS] Skip LoRa TX because crypto failed\r\n");
+        sensor_lora_sleep();
+        return;
+    }
+
     debug_dump_hex("[FRAME]", (const uint8_t *)&tx_frame, sizeof(tx_frame));
 
     tx_ok = sensor_lora_transmit((const uint8_t *)&tx_frame, sizeof(tx_frame));
     if (tx_ok != SENSOR_OK) {
         sensor_debug_print("[SYS] LoRa TX FAILED for frame=%u\r\n", g_frame_counter);
+        sensor_lora_sleep();
+        return;
     }
-
-    sensor_lora_sleep();
-    //HAL_GPIO_WritePin(TPS_SYNC_GPIO_Port, TPS_SYNC_Pin, GPIO_PIN_RESET);
 
     g_frame_counter++;
 
+    sensor_lora_sleep();
+
+    HAL_IWDG_Refresh(&hiwdg);
+
     sensor_debug_print("[SYS] ===== APP CYCLE END =====\r\n");
 }
-
 /* USER CODE END 0 */
 
 /**
@@ -246,20 +276,30 @@ int main(void)
   /* USER CODE BEGIN 2 */
   uint8_t lora_cfg[6];
 
-       if (sensor_lora_write_default_config() != SENSOR_OK) {
-           sensor_debug_print("[SYS] E32 config write FAILED\r\n");
-       } else {
-           sensor_debug_print("[SYS] E32 config write OK\r\n");
+  if (sensor_lora_read_config(lora_cfg) == SENSOR_OK) {
+      debug_dump_hex("[LORA_CFG]", lora_cfg, sizeof(lora_cfg));
 
-           if (sensor_lora_read_config(lora_cfg) == SENSOR_OK) {
-               debug_dump_hex("[LORA_CFG]", lora_cfg, sizeof(lora_cfg));
-           } else {
-               sensor_debug_print("[SYS] E32 config read FAILED\r\n");
-           }
-       }
+      if (!lora_cfg_is_target(lora_cfg)) {
+          sensor_debug_print("[SYS] E32 config mismatch, writing target config\r\n");
 
-       /* để module ngủ chờ chu kỳ đầu tiên */
-       sensor_lora_sleep();
+          if (sensor_lora_write_default_config() != SENSOR_OK) {
+              sensor_debug_print("[SYS] E32 config write FAILED\r\n");
+          } else {
+              sensor_debug_print("[SYS] E32 config write OK\r\n");
+          }
+      } else {
+          sensor_debug_print("[SYS] E32 config already OK\r\n");
+      }
+  } else {
+      sensor_debug_print("[SYS] E32 config read FAILED, try write once\r\n");
+
+      if (sensor_lora_write_default_config() != SENSOR_OK) {
+          sensor_debug_print("[SYS] E32 config write FAILED\r\n");
+      }
+  }
+
+  sensor_lora_sleep();
+  HAL_IWDG_Refresh(&hiwdg);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -269,9 +309,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  App_Run_One_Cycle();
-	  HAL_Delay(APP_CYCLE_PERIOD_MS);
+	      HAL_IWDG_Refresh(&hiwdg);
 
+	      App_Run_One_Cycle();
+
+	      HAL_IWDG_Refresh(&hiwdg);
+
+	      App_Delay_With_Watchdog(APP_CYCLE_PERIOD_MS);
   }
   /* USER CODE END 3 */
 }

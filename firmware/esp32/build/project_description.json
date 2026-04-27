@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "app-template",
-    "project_version":    "d6e2b11-dirty",
+    "project_version":    "c8747db-dirty",
     "project_path":       "D:/Github/Course-Project-1/firmware/esp32",
     "idf_path":           "C:/esp/v5.5.3/esp-idf",
     "build_dir":          "D:/Github/Course-Project-1/firmware/esp32/build",
