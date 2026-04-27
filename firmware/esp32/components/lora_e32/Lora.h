@@ -171,7 +171,8 @@ int e32_write_fixed(e32_t *dev,
                     size_t len);
 
 int e32_write_config(e32_t *dev, e32_cfg_cmd_t cmd, const e32_config_t *cfg);
-
+int e32_read_config(e32_t *dev, uint8_t out_cfg[6]);
+int e32_write_config_verified(e32_t *dev, e32_cfg_cmd_t cmd, const e32_config_t *cfg, uint8_t out_cfg[6]);
 #ifdef __cplusplus
 }
 #endif

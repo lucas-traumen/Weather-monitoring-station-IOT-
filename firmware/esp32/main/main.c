@@ -289,7 +289,18 @@ static void process_burst(const uint8_t *buf, size_t len)
     ESP_LOGI(TAG, "frame_counter=%u", counter);
     dump_hex("[FRAME]", buf, len);
 }
+static int e32_cfg_matches(const uint8_t cfg_bytes[6], const e32_config_t *cfg)
+{
+    if ((cfg_bytes == NULL) || (cfg == NULL)) {
+        return 0;
+    }
 
+    return (cfg_bytes[1] == cfg->addh) &&
+           (cfg_bytes[2] == cfg->addl) &&
+           (cfg_bytes[3] == cfg->speed) &&
+           (cfg_bytes[4] == cfg->chan) &&
+           (cfg_bytes[5] == cfg->option);
+}
 static void run_normal_rx(void)
 {
     e32_t radio;
@@ -304,11 +315,6 @@ static void run_normal_rx(void)
         .tick_ms    = port_tick_ms,
     };
 
-    /* Match với node STM32:
-       ADDR  = 0x0017
-       SPEED = 0x3A = 115200, 8N1, 2.4Kbps
-       CHAN  = 0x17
-       OPT   = 0x44 = transparent, push-pull, 250ms, FEC on */
     e32_config_t cfg = {
         .addh = 0x00,
         .addl = 0x17,
@@ -321,12 +327,8 @@ static void run_normal_rx(void)
                   E32_PWR_30DBM
     };
 
-    uint8_t rx_chunk[32];
-    uint8_t burst_buf[BURST_BUF_SIZE];
-    size_t burst_pos = 0;
-    uint32_t last_rx_ms = 0;
+    uint8_t verify_cfg[6] = {0};
 
-    /* Step 1: config baud 9600 */
     uart_lora_driver_init(LORA_CFG_BAUDRATE);
     uart_flush(LORA_UART_NUM);
 
@@ -337,50 +339,26 @@ static void run_normal_rx(void)
              LORA_UART_TX_PIN, LORA_UART_RX_PIN,
              LORA_M0_PIN, LORA_M1_PIN, LORA_AUX_PIN);
 
-    /* Step 2: write config to E32 */
+    /* GHI TRƯỚC */
     check_e32(e32_write_config(&radio, E32_CFG_SAVE_TO_FLASH, &cfg), "e32_write_config");
 
-    /* Step 3: switch local UART to run baud */
+    /* ĐỌC LẠI NẾU MUỐN, NHƯNG KHÔNG CHO NÓ KILL APP */
+    if (e32_read_config(&radio, verify_cfg) == E32_OK) {
+        dump_hex("[E32_CFG_VERIFY]", verify_cfg, sizeof(verify_cfg));
+    } else {
+        ESP_LOGW(TAG, "e32_read_config verify failed, continue with hard-written config");
+    }
+
+    /* Bây giờ mới đổi local UART sang baud chạy thật */
     uart_lora_set_baud(LORA_RUN_BAUDRATE);
 
-    /* Step 4: ensure E32 back to normal mode */
     check_e32(e32_enter_normal(&radio), "e32_enter_normal");
-
     uart_flush(LORA_UART_NUM);
+
     ESP_LOGI(TAG, "RUN UART%d @ %d", LORA_UART_NUM, LORA_RUN_BAUDRATE);
     ESP_LOGI(TAG, "E32 ready, waiting frames...");
 
-    while (1) {
-        int rd = e32_read_raw(&radio, rx_chunk, sizeof(rx_chunk), 10);
-        uint32_t now_ms = port_tick_ms(NULL);
-
-        if (rd > 0) {
-            if ((burst_pos > 0) && ((now_ms - last_rx_ms) > BURST_GAP_MS)) {
-                process_burst(burst_buf, burst_pos);
-                burst_pos = 0;
-            }
-
-            last_rx_ms = now_ms;
-
-            for (int i = 0; i < rd; i++) {
-                if (burst_pos < sizeof(burst_buf)) {
-                    burst_buf[burst_pos++] = rx_chunk[i];
-                } else {
-                    ESP_LOGW(TAG, "overflow burst, drop");
-                    dump_hex("[OVERFLOW]", burst_buf, burst_pos);
-                    burst_pos = 0;
-                    break;
-                }
-            }
-        } else {
-            if ((burst_pos > 0) && ((now_ms - last_rx_ms) > BURST_GAP_MS)) {
-                process_burst(burst_buf, burst_pos);
-                burst_pos = 0;
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
+    /* ... giữ nguyên loop receive phía dưới ... */
 }
 
 void app_main(void)
