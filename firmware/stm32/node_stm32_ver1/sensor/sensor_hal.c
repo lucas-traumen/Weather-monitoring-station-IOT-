@@ -48,7 +48,12 @@ static uint8_t sensor_lora_wait_aux_high(uint32_t timeout_ms)
 
 void sensor_delay_ms(uint32_t ms)
 {
-    HAL_Delay(ms);
+    uint32_t start = HAL_GetTick();
+
+    while ((HAL_GetTick() - start) < ms) {
+        HAL_IWDG_Refresh(&hiwdg);
+        HAL_Delay(10);
+    }
 }
 
 void sensor_debug_print(const char *fmt, ...)

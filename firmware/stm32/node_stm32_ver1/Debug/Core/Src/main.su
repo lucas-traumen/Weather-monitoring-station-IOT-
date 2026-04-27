@@ -1,5 +1,7 @@
-../Core/Src/main.c:125:13:App_Delay_With_Watchdog	16	static
-../Core/Src/main.c:111:13:debug_dump_hex.part.0	16	static
-../Core/Src/main.c:327:6:SystemClock_Config	96	static,ignoring_inline_asm
-../Core/Src/main.c:245:5:main	152	static,ignoring_inline_asm
-../Core/Src/main.c:647:6:Error_Handler	0	static,ignoring_inline_asm
+../Core/Src/main.c:170:13:App_Delay_With_Watchdog	16	static
+../Core/Src/main.c:102:13:debug_dump_hex.part.0	16	static
+../Core/Src/main.c:221:16:App_RTC_Schedule_Next_Alarm.constprop	48	static
+../Core/Src/main.c:264:6:HAL_RTC_AlarmAEventCallback	0	static
+../Core/Src/main.c:466:6:SystemClock_Config	96	static,ignoring_inline_asm
+../Core/Src/main.c:329:5:main	152	static,ignoring_inline_asm
+../Core/Src/main.c:786:6:Error_Handler	0	static,ignoring_inline_asm
