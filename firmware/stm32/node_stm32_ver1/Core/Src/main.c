@@ -31,16 +31,8 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-typedef struct __attribute__((packed)) {
-    uint16_t frame_counter;
-    uint8_t  ciphertext[9];
-    uint8_t  mac_tag[4];
-} LoRaTxFrame_t;
 
-typedef char check_sensor_payload_size[(sizeof(SensorData_t) == 9U) ? 1 : -1];
-typedef char check_lora_frame_size[(sizeof(LoRaTxFrame_t) == 15U) ? 1 : -1];
-
-
+/* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
