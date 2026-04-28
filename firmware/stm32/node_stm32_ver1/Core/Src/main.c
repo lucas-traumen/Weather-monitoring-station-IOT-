@@ -37,15 +37,27 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define TPS_SYNC_PORT   GPIOA
-#define TPS_SYNC_PIN    GPIO_PIN_6
+#define TPS_SYNC_PORT               GPIOA
+#define TPS_SYNC_PIN                GPIO_PIN_6
 
 #define SENSOR_POWER_SETTLE_MS      20U
 #define SENSOR_MEASURE_WAIT_MS      150U
 
-
+/*
+ * Test mode:
+ * - IWDG timeout is about 25s with LSI around 40kHz, prescaler 256, reload 3906.
+ * - RTC heartbeat must be lower than IWDG timeout.
+ * - TX every 30s = 3 heartbeats x 10s.
+ */
 #define APP_RTC_HEARTBEAT_SEC       10U
 #define APP_TX_PERIOD_SEC           30U
+#define APP_TX_HEARTBEATS           (APP_TX_PERIOD_SEC / APP_RTC_HEARTBEAT_SEC)
+
+#define BKP_MAGIC_VALUE             0xA55AU
+#define BKP_REG_MAGIC               RTC_BKP_DR1
+#define BKP_REG_FRAME_COUNTER_LO    RTC_BKP_DR2
+#define BKP_REG_FRAME_COUNTER_HI    RTC_BKP_DR3
+#define BKP_REG_HEARTBEAT_COUNT     RTC_BKP_DR4
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -69,11 +81,12 @@ static const uint8_t ASCON_SECRET_KEY[16] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
+typedef char check_sensor_payload_size[(sizeof(SensorData_t) == 9U) ? 1 : -1];
+typedef char check_lora_frame_size[(sizeof(LoRaTxFrame_t) == 15U) ? 1 : -1];
 
-static uint16_t g_frame_counter = 0U;
-static volatile uint8_t  g_rtc_tick_due = 0U;
-static volatile uint32_t g_rtc_alarm_count = 0U;
-static uint32_t g_tx_elapsed_sec = 0U;
+
+//static uint32_t g_tx_elapsed_sec = 0U;
+static uint32_t g_frame_counter = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -91,6 +104,7 @@ static void MX_RTC_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void Error_Handler_Print_And_Stop(const char *msg);
 static void debug_dump_hex(const char *prefix, const uint8_t *data, uint16_t len)
 {
     uint16_t i;
@@ -115,6 +129,17 @@ static uint8_t lora_cfg_is_target(const uint8_t cfg[6])
             cfg[4] == 0x17 &&
             cfg[5] == 0x44);
 }
+
+static void App_Delay_With_Watchdog(uint32_t ms)
+{
+    uint32_t start = HAL_GetTick();
+
+    while ((HAL_GetTick() - start) < ms) {
+        HAL_IWDG_Refresh(&hiwdg);
+        HAL_Delay(20);
+    }
+}
+
 static uint8_t Edge_Crypto_Pack(const SensorData_t *raw_data,
                                 uint16_t counter,
                                 LoRaTxFrame_t *tx_frame)
@@ -132,6 +157,7 @@ static uint8_t Edge_Crypto_Pack(const SensorData_t *raw_data,
     memset(tx_frame, 0, sizeof(*tx_frame));
     memcpy(plaintext, raw_data, sizeof(plaintext));
 
+    /* Keep the old working 15-byte radio protocol. */
     nonce[0] = (uint8_t)(counter >> 8);
     nonce[1] = (uint8_t)(counter & 0xFFU);
     nonce[2] = 0x57U;
@@ -159,24 +185,83 @@ static uint8_t Edge_Crypto_Pack(const SensorData_t *raw_data,
 
     return SENSOR_OK;
 }
-static void App_Delay_With_Watchdog(uint32_t ms)
-{
-    uint32_t start = HAL_GetTick();
 
-    while ((HAL_GetTick() - start) < ms) {
-        HAL_IWDG_Refresh(&hiwdg);
-        HAL_Delay(50);
+/* Backup register helpers --------------------------------------------------*/
+
+static void App_Backup_Enable(void)
+{
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_RCC_BKP_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+}
+
+static uint32_t App_BKP_Read32(uint32_t reg_lo, uint32_t reg_hi)
+{
+    uint32_t lo = HAL_RTCEx_BKUPRead(&hrtc, reg_lo) & 0xFFFFU;
+    uint32_t hi = HAL_RTCEx_BKUPRead(&hrtc, reg_hi) & 0xFFFFU;
+
+    return lo | (hi << 16);
+}
+
+static void App_BKP_Write32(uint32_t reg_lo, uint32_t reg_hi, uint32_t value)
+{
+    HAL_RTCEx_BKUPWrite(&hrtc, reg_lo, value & 0xFFFFU);
+    HAL_RTCEx_BKUPWrite(&hrtc, reg_hi, (value >> 16) & 0xFFFFU);
+}
+
+static void App_Backup_Init_If_Needed(void)
+{
+    App_Backup_Enable();
+
+    if (HAL_RTCEx_BKUPRead(&hrtc, BKP_REG_MAGIC) != BKP_MAGIC_VALUE) {
+        HAL_RTCEx_BKUPWrite(&hrtc, BKP_REG_MAGIC, BKP_MAGIC_VALUE);
+        App_BKP_Write32(BKP_REG_FRAME_COUNTER_LO, BKP_REG_FRAME_COUNTER_HI, 0U);
+        HAL_RTCEx_BKUPWrite(&hrtc, BKP_REG_HEARTBEAT_COUNT, 0U);
+
+        sensor_debug_print("[BKP] Init backup registers\r\n");
     }
 }
+
+static uint32_t App_FrameCounter_Read(void)
+{
+    return App_BKP_Read32(BKP_REG_FRAME_COUNTER_LO, BKP_REG_FRAME_COUNTER_HI);
+}
+
+static void App_FrameCounter_Write(uint32_t counter)
+{
+    App_BKP_Write32(BKP_REG_FRAME_COUNTER_LO, BKP_REG_FRAME_COUNTER_HI, counter);
+}
+
+static uint32_t App_FrameCounter_Reserve(void)
+{
+    uint32_t counter = App_FrameCounter_Read();
+
+    /* Reserve before encryption to avoid nonce reuse after an unexpected reset. */
+    App_FrameCounter_Write(counter + 1U);
+
+    return counter;
+}
+
+static uint16_t App_Heartbeat_Read(void)
+{
+    return (uint16_t)HAL_RTCEx_BKUPRead(&hrtc, BKP_REG_HEARTBEAT_COUNT);
+}
+
+static void App_Heartbeat_Write(uint16_t count)
+{
+    HAL_RTCEx_BKUPWrite(&hrtc, BKP_REG_HEARTBEAT_COUNT, count);
+}
+
+/* RTC alarm helpers ---------------------------------------------------------*/
+
 static void App_RTC_Seconds_To_Time(uint32_t seconds_of_day, RTC_TimeTypeDef *time)
 {
     seconds_of_day %= 86400U;
 
     memset(time, 0, sizeof(*time));
 
-    time->Hours   = (uint8_t)(seconds_of_day / 3600U);
+    time->Hours = (uint8_t)(seconds_of_day / 3600U);
     seconds_of_day %= 3600U;
-
     time->Minutes = (uint8_t)(seconds_of_day / 60U);
     time->Seconds = (uint8_t)(seconds_of_day % 60U);
 }
@@ -194,10 +279,7 @@ static uint8_t App_RTC_Get_Seconds_Of_Day(uint32_t *seconds_out)
         return SENSOR_ERR;
     }
 
-    /*
-     * Important: HAL yêu cầu đọc date sau khi đọc time
-     * để unlock shadow register.
-     */
+    /* STM32 HAL requires reading date after time to unlock shadow registers. */
     if (HAL_RTC_GetDate(&hrtc, &now_date, RTC_FORMAT_BIN) != HAL_OK) {
         return SENSOR_ERR;
     }
@@ -232,10 +314,9 @@ static uint8_t App_RTC_Schedule_Next_Alarm(uint32_t after_seconds)
     alarm.AlarmTime = alarm_time;
     alarm.Alarm = RTC_ALARM_A;
 
-    /*
-     * Không fail nếu alarm cũ chưa tồn tại.
-     */
     (void)HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
+    __HAL_RTC_ALARM_CLEAR_FLAG(&hrtc, RTC_FLAG_ALRAF);
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
 
     if (HAL_RTC_SetAlarm_IT(&hrtc, &alarm, RTC_FORMAT_BIN) != HAL_OK) {
         sensor_debug_print("[RTC] Set alarm FAILED\r\n");
@@ -243,7 +324,7 @@ static uint8_t App_RTC_Schedule_Next_Alarm(uint32_t after_seconds)
     }
 
     sensor_debug_print(
-        "[RTC] Next TX alarm in %lu sec at %02u:%02u:%02u\r\n",
+        "[RTC] Next alarm in %lu sec at %02u:%02u:%02u\r\n",
         (unsigned long)after_seconds,
         alarm_time.Hours,
         alarm_time.Minutes,
@@ -253,21 +334,94 @@ static uint8_t App_RTC_Schedule_Next_Alarm(uint32_t after_seconds)
     return SENSOR_OK;
 }
 
+/* With STANDBY, RTC alarm wake restarts main(). */
 void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *hrtc_cb)
 {
-    if (hrtc_cb->Instance == RTC) {
-    	g_rtc_tick_due  = 1U;
-        g_rtc_alarm_count++;
-    }
+    (void)hrtc_cb;
 }
-uint8_t init_status;
-uint8_t tx_ok;
-SensorData_t payload;
-LoRaTxFrame_t tx_frame;
+
+/* Power helpers -------------------------------------------------------------*/
+
+static uint8_t App_Was_Standby_Wakeup(void)
+{
+    uint8_t was_standby = 0U;
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+
+    if (__HAL_PWR_GET_FLAG(PWR_FLAG_SB) != RESET) {
+        was_standby = 1U;
+    }
+
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_SB);
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+
+    return was_standby;
+}
+
+static void App_Enter_Standby(void)
+{
+    sensor_debug_print("[PWR] Enter STANDBY\r\n");
+
+    /* Put E32 into Sleep/Config mode before MCU standby. */
+    sensor_lora_sleep();
+
+    /* Let UART1 finish debug logs. */
+    HAL_Delay(100);
+
+    HAL_IWDG_Refresh(&hiwdg);
+
+    App_Backup_Enable();
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+
+    HAL_PWR_EnterSTANDBYMode();
+
+    Error_Handler();
+}
+
+/* LoRa config once at cold boot --------------------------------------------*/
+
+static void App_LoRa_Config_Check_Once(void)
+{
+    uint8_t lora_cfg[6];
+
+    sensor_debug_print("[SYS] Cold boot E32 config check\r\n");
+
+    if (sensor_lora_read_config(lora_cfg) == SENSOR_OK) {
+        debug_dump_hex("[LORA_CFG]", lora_cfg, sizeof(lora_cfg));
+
+        if (!lora_cfg_is_target(lora_cfg)) {
+            sensor_debug_print("[SYS] E32 config mismatch, writing target config\r\n");
+
+            if (sensor_lora_write_default_config() != SENSOR_OK) {
+                sensor_debug_print("[SYS] E32 config write FAILED\r\n");
+            } else {
+                sensor_debug_print("[SYS] E32 config write OK\r\n");
+            }
+        } else {
+            sensor_debug_print("[SYS] E32 config already OK\r\n");
+        }
+    } else {
+        sensor_debug_print("[SYS] E32 config read FAILED, try write once\r\n");
+
+        if (sensor_lora_write_default_config() != SENSOR_OK) {
+            sensor_debug_print("[SYS] E32 config write FAILED\r\n");
+        }
+    }
+
+    /* Keep radio asleep after cold-boot config. */
+    sensor_lora_sleep();
+}
+
+/* App cycle -----------------------------------------------------------------*/
 
 static void App_Run_One_Cycle(void)
 {
-
+    uint8_t init_status;
+    uint8_t tx_ok;
+    SensorData_t payload;
+    LoRaTxFrame_t tx_frame;
+    uint32_t tx_counter32;
+    uint16_t tx_counter16;
 
     memset(&payload, 0, sizeof(payload));
     memset(&tx_frame, 0, sizeof(tx_frame));
@@ -289,7 +443,12 @@ static void App_Run_One_Cycle(void)
     Sensors_Collect_And_Pack(&payload);
     debug_dump_hex("[PAYLOAD]", (const uint8_t *)&payload, sizeof(payload));
 
-    if (Edge_Crypto_Pack(&payload, g_frame_counter, &tx_frame) != SENSOR_OK) {
+    /* Backup counter is 32-bit; radio frame remains old 15-byte protocol. */
+    tx_counter32 = App_FrameCounter_Reserve();
+    tx_counter16 = (uint16_t)(tx_counter32 & 0xFFFFU);
+    g_frame_counter = tx_counter32;
+
+    if (Edge_Crypto_Pack(&payload, tx_counter16, &tx_frame) != SENSOR_OK) {
         sensor_debug_print("[SYS] Skip LoRa TX because crypto failed\r\n");
         sensor_lora_sleep();
         return;
@@ -297,20 +456,40 @@ static void App_Run_One_Cycle(void)
 
     debug_dump_hex("[FRAME]", (const uint8_t *)&tx_frame, sizeof(tx_frame));
 
+    /* Do not read/write E32 config here. Keep TX timing clean. */
     tx_ok = sensor_lora_transmit((const uint8_t *)&tx_frame, sizeof(tx_frame));
     if (tx_ok != SENSOR_OK) {
-        sensor_debug_print("[SYS] LoRa TX FAILED for frame=%u\r\n", g_frame_counter);
+        sensor_debug_print(
+            "[SYS] LoRa TX FAILED for frame32=%lu frame16=%u\r\n",
+            (unsigned long)tx_counter32,
+            tx_counter16
+        );
         sensor_lora_sleep();
         return;
     }
 
-    g_frame_counter++;
+    sensor_debug_print(
+        "[SYS] TX done for frame32=%lu frame16=%u len=%u\r\n",
+        (unsigned long)tx_counter32,
+        tx_counter16,
+        (unsigned)sizeof(tx_frame)
+    );
 
+    /* Extra margin before sleeping E32. */
+    HAL_Delay(120);
     sensor_lora_sleep();
 
     HAL_IWDG_Refresh(&hiwdg);
 
     sensor_debug_print("[SYS] ===== APP CYCLE END =====\r\n");
+}
+
+static void Error_Handler_Print_And_Stop(const char *msg)
+{
+    if (msg != NULL) {
+        sensor_debug_print("[ERR] %s\r\n", msg);
+    }
+    Error_Handler();
 }
 /* USER CODE END 0 */
 
@@ -350,46 +529,65 @@ int main(void)
   MX_USART1_UART_Init();
   MX_RTC_Init();
   /* USER CODE BEGIN 2 */
-  uint8_t lora_cfg[6];
 
-  if (sensor_lora_read_config(lora_cfg) == SENSOR_OK) {
-      debug_dump_hex("[LORA_CFG]", lora_cfg, sizeof(lora_cfg));
+  uint8_t woke_from_standby;
+    uint16_t heartbeat_count;
 
-      if (!lora_cfg_is_target(lora_cfg)) {
-          sensor_debug_print("[SYS] E32 config mismatch, writing target config\r\n");
+    App_Backup_Init_If_Needed();
 
-          if (sensor_lora_write_default_config() != SENSOR_OK) {
-              sensor_debug_print("[SYS] E32 config write FAILED\r\n");
-          } else {
-              sensor_debug_print("[SYS] E32 config write OK\r\n");
-          }
-      } else {
-          sensor_debug_print("[SYS] E32 config already OK\r\n");
-      }
-  } else {
-      sensor_debug_print("[SYS] E32 config read FAILED, try write once\r\n");
+    woke_from_standby = App_Was_Standby_Wakeup();
 
-      if (sensor_lora_write_default_config() != SENSOR_OK) {
-          sensor_debug_print("[SYS] E32 config write FAILED\r\n");
-      }
-  }
+    g_frame_counter = App_FrameCounter_Read();
+    heartbeat_count = App_Heartbeat_Read();
 
-  sensor_lora_sleep();
-  HAL_IWDG_Refresh(&hiwdg);
-  g_rtc_tick_due = 0U;
-  g_rtc_alarm_count = 0U;
-  g_tx_elapsed_sec = 0U;
+    sensor_debug_print(
+        "\r\n[BOOT] standby=%u frame=%lu heartbeat=%u\r\n",
+        woke_from_standby,
+        (unsigned long)g_frame_counter,
+        heartbeat_count
+    );
 
-  /*
-   * Alarm đầu tiên phải là heartbeat, không phải TX period.
-   * Vì IWDG ~25s, không được chờ 30s ngay từ đầu.
-   */
-  if (App_RTC_Schedule_Next_Alarm(APP_RTC_HEARTBEAT_SEC) != SENSOR_OK) {
-      sensor_debug_print("[SYS] RTC heartbeat start FAILED\r\n");
-  } else {
-      sensor_debug_print("[SYS] RTC heartbeat started\r\n");
-  }
+    /* Only check/configure E32 on cold boot, not right before every TX. */
+    if (woke_from_standby == 0U) {
+        heartbeat_count = 0U;
+        App_Heartbeat_Write(heartbeat_count);
+        App_LoRa_Config_Check_Once();
+    } else {
+        heartbeat_count++;
+        App_Heartbeat_Write(heartbeat_count);
+    }
 
+    if (heartbeat_count < APP_TX_HEARTBEATS) {
+        sensor_debug_print(
+            "[RTC] Heartbeat %u/%u, no TX\r\n",
+            heartbeat_count,
+            (unsigned)APP_TX_HEARTBEATS
+        );
+
+        if (App_RTC_Schedule_Next_Alarm(APP_RTC_HEARTBEAT_SEC) != SENSOR_OK) {
+            Error_Handler_Print_And_Stop("RTC heartbeat schedule FAILED");
+        }
+
+        App_Enter_Standby();
+    }
+
+    /* TX is due. */
+    App_Heartbeat_Write(0U);
+
+    sensor_debug_print("[RTC] TX due\r\n");
+    sensor_debug_print("[SYS] Skip E32 config check before TX\r\n");
+
+    /* Give E32 a little pre-TX normal-mode margin. */
+    sensor_lora_normal();
+    HAL_Delay(200);
+
+    App_Run_One_Cycle();
+
+    if (App_RTC_Schedule_Next_Alarm(APP_RTC_HEARTBEAT_SEC) != SENSOR_OK) {
+        Error_Handler_Print_And_Stop("RTC heartbeat schedule after TX FAILED");
+    }
+
+    App_Enter_Standby();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -399,54 +597,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if (g_rtc_tick_due != 0U) {
-	          g_rtc_tick_due = 0U;
-
-	          /*
-	           * Lập lịch alarm kế tiếp NGAY khi vừa thức dậy.
-	           * Làm vậy để thời gian chạy App_Run_One_Cycle()
-	           * không làm trôi lịch RTC.
-	           */
-	          if (App_RTC_Schedule_Next_Alarm(APP_RTC_HEARTBEAT_SEC) != SENSOR_OK) {
-	              sensor_debug_print("[SYS] RTC reschedule FAILED\r\n");
-	          }
-
-	          /*
-	           * Đây mới là nơi đá IWDG chính thức khi RTC heartbeat chạy.
-	           * Nếu main bị treo, nó sẽ không tới đây và IWDG sẽ reset.
-	           */
-	          HAL_IWDG_Refresh(&hiwdg);
-
-	          sensor_debug_print(
-	              "\r\n[RTC] Heartbeat #%lu, tx_elapsed=%lu/%lu sec\r\n",
-	              (unsigned long)g_rtc_alarm_count,
-	              (unsigned long)g_tx_elapsed_sec,
-	              (unsigned long)APP_TX_PERIOD_SEC
-	          );
-
-	          g_tx_elapsed_sec += APP_RTC_HEARTBEAT_SEC;
-
-	          if (g_tx_elapsed_sec >= APP_TX_PERIOD_SEC) {
-	              g_tx_elapsed_sec = 0U;
-
-	              sensor_debug_print("[RTC] TX due\r\n");
-
-	              App_Run_One_Cycle();
-
-	              /*
-	               * Sau khi hoàn tất một chu kỳ đo + mã hóa + gửi LoRa,
-	               * refresh thêm lần nữa.
-	               */
-	              HAL_IWDG_Refresh(&hiwdg);
-	          }
-	      }
-
-	      /*
-	       * __WFI vẫn có thể bị SysTick đánh thức,
-	       * nhưng vì ta KHÔNG refresh IWDG ở đầu vòng lặp nữa,
-	       * SysTick không còn vô tình nuôi watchdog.
-	       */
-	      __WFI();
+	  Error_Handler();
   }
   /* USER CODE END 3 */
 }
@@ -624,11 +775,33 @@ static void MX_RTC_Init(void)
   }
 
   /* USER CODE BEGIN Check_RTC_BKUP */
+  App_Backup_Enable();
+  if (HAL_RTCEx_BKUPRead(&hrtc, BKP_REG_MAGIC) != BKP_MAGIC_VALUE)
+  {
+      sTime.Hours = 0x0;
+      sTime.Minutes = 0x0;
+      sTime.Seconds = 0x0;
 
+      if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+      {
+          Error_Handler();
+      }
+
+      DateToUpdate.WeekDay = RTC_WEEKDAY_MONDAY;
+      DateToUpdate.Month = RTC_MONTH_JANUARY;
+      DateToUpdate.Date = 0x1;
+      DateToUpdate.Year = 0x0;
+
+      if (HAL_RTC_SetDate(&hrtc, &DateToUpdate, RTC_FORMAT_BCD) != HAL_OK)
+      {
+          Error_Handler();
+      }
+  }
   /* USER CODE END Check_RTC_BKUP */
 
   /** Initialize RTC and set the Time and Date
   */
+#if 0
   sTime.Hours = 0x0;
   sTime.Minutes = 0x0;
   sTime.Seconds = 0x0;
@@ -646,6 +819,7 @@ static void MX_RTC_Init(void)
   {
     Error_Handler();
   }
+#endif
   /* USER CODE BEGIN RTC_Init 2 */
 
   /* USER CODE END RTC_Init 2 */

@@ -28,6 +28,12 @@ typedef enum {
     SENSOR_OK = 0,
     SENSOR_ERR = 1
 } sensor_status_t;
+typedef struct __attribute__((packed)) {
+    uint16_t frame_counter;
+    uint8_t  ciphertext[9];
+    uint8_t  mac_tag[4];
+} LoRaTxFrame_t;
+
 
 void sensor_delay_ms(uint32_t ms);
 void sensor_debug_print(const char *fmt, ...);
