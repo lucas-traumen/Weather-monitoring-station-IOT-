@@ -29,7 +29,7 @@ typedef enum {
     SENSOR_ERR = 1
 } sensor_status_t;
 typedef struct __attribute__((packed)) {
-    uint16_t frame_counter;
+    uint32_t frame_counter;
     uint8_t  ciphertext[9];
     uint8_t  mac_tag[4];
 } LoRaTxFrame_t;

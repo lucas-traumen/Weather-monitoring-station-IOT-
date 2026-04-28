@@ -1,9 +1,9 @@
-../Core/Src/main.c:191:13:App_Backup_Enable	1
+../Core/Src/main.c:193:13:App_Backup_Enable	1
 ../Core/Src/main.c:133:13:App_Delay_With_Watchdog	2
-../Core/Src/main.c:361:13:App_Enter_Standby	1
+../Core/Src/main.c:363:13:App_Enter_Standby	1
 ../Core/Src/main.c:108:13:debug_dump_hex.part.0	2
-../Core/Src/main.c:295:16:App_RTC_Schedule_Next_Alarm.constprop	4
-../Core/Src/main.c:338:6:HAL_RTC_AlarmAEventCallback	1
-../Core/Src/main.c:609:6:SystemClock_Config	4
-../Core/Src/main.c:500:5:main	26
-../Core/Src/main.c:952:6:Error_Handler	1
+../Core/Src/main.c:297:16:App_RTC_Schedule_Next_Alarm.constprop	4
+../Core/Src/main.c:340:6:HAL_RTC_AlarmAEventCallback	1
+../Core/Src/main.c:610:6:SystemClock_Config	4
+../Core/Src/main.c:501:5:main	28
+../Core/Src/main.c:951:6:Error_Handler	1

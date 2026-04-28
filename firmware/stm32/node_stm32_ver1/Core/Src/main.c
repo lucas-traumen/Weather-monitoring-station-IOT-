@@ -82,7 +82,7 @@ static const uint8_t ASCON_SECRET_KEY[16] = {
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
 typedef char check_sensor_payload_size[(sizeof(SensorData_t) == 9U) ? 1 : -1];
-typedef char check_lora_frame_size[(sizeof(LoRaTxFrame_t) == 15U) ? 1 : -1];
+typedef char check_lora_frame_size[(sizeof(LoRaTxFrame_t) == 17U) ? 1 : -1];
 
 
 //static uint32_t g_tx_elapsed_sec = 0U;
@@ -157,13 +157,15 @@ static uint8_t Edge_Crypto_Pack(const SensorData_t *raw_data,
     memset(tx_frame, 0, sizeof(*tx_frame));
     memcpy(plaintext, raw_data, sizeof(plaintext));
 
-    /* Keep the old working 15-byte radio protocol. */
-    nonce[0] = (uint8_t)(counter >> 8);
-    nonce[1] = (uint8_t)(counter & 0xFFU);
-    nonce[2] = 0x57U;
-    nonce[3] = 0x53U;
-    nonce[4] = 0x4EU;
-    nonce[5] = 0x31U;
+    nonce[0] = (uint8_t)(counter >> 24);
+    nonce[1] = (uint8_t)(counter >> 16);
+    nonce[2] = (uint8_t)(counter >> 8);
+    nonce[3] = (uint8_t)(counter);
+
+    nonce[4] = 0x57U;
+    nonce[5] = 0x53U;
+    nonce[6] = 0x4EU;
+    nonce[7] = 0x31U;
 
     ret = crypto_aead_encrypt(
         ascon_output, &clen,
@@ -421,7 +423,7 @@ static void App_Run_One_Cycle(void)
     SensorData_t payload;
     LoRaTxFrame_t tx_frame;
     uint32_t tx_counter32;
-    uint16_t tx_counter16;
+
 
     memset(&payload, 0, sizeof(payload));
     memset(&tx_frame, 0, sizeof(tx_frame));
@@ -445,10 +447,10 @@ static void App_Run_One_Cycle(void)
 
     /* Backup counter is 32-bit; radio frame remains old 15-byte protocol. */
     tx_counter32 = App_FrameCounter_Reserve();
-    tx_counter16 = (uint16_t)(tx_counter32 & 0xFFFFU);
+   // tx_counter16 = (uint16_t)(tx_counter32 & 0xFFFFU);
     g_frame_counter = tx_counter32;
 
-    if (Edge_Crypto_Pack(&payload, tx_counter16, &tx_frame) != SENSOR_OK) {
+    if (Edge_Crypto_Pack(&payload,tx_counter32,  &tx_frame) != SENSOR_OK) {
         sensor_debug_print("[SYS] Skip LoRa TX because crypto failed\r\n");
         sensor_lora_sleep();
         return;
@@ -460,18 +462,17 @@ static void App_Run_One_Cycle(void)
     tx_ok = sensor_lora_transmit((const uint8_t *)&tx_frame, sizeof(tx_frame));
     if (tx_ok != SENSOR_OK) {
         sensor_debug_print(
-            "[SYS] LoRa TX FAILED for frame32=%lu frame16=%u\r\n",
-            (unsigned long)tx_counter32,
-            tx_counter16
+            "[SYS] LoRa TX FAILED for frame32=%lu f\r\n",
+            (unsigned long)tx_counter32
         );
         sensor_lora_sleep();
         return;
     }
 
     sensor_debug_print(
-        "[SYS] TX done for frame32=%lu frame16=%u len=%u\r\n",
+        "[SYS] TX done v2 for frame32=%lu len=%u\r\n",
         (unsigned long)tx_counter32,
-        tx_counter16,
+
         (unsigned)sizeof(tx_frame)
     );
 
@@ -801,7 +802,6 @@ static void MX_RTC_Init(void)
 
   /** Initialize RTC and set the Time and Date
   */
-#if 0
   sTime.Hours = 0x0;
   sTime.Minutes = 0x0;
   sTime.Seconds = 0x0;
@@ -819,7 +819,6 @@ static void MX_RTC_Init(void)
   {
     Error_Handler();
   }
-#endif
   /* USER CODE BEGIN RTC_Init 2 */
 
   /* USER CODE END RTC_Init 2 */
@@ -911,7 +910,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LED_DEBUG_GPIO_Port, LED_DEBUG_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED_DEBUG_GPIO_Port, LED_DEBUG_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, LORA_M0_Pin|LORA_M1_Pin, GPIO_PIN_RESET);
@@ -919,7 +918,7 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin : LED_DEBUG_Pin */
   GPIO_InitStruct.Pin = LED_DEBUG_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LED_DEBUG_GPIO_Port, &GPIO_InitStruct);
 

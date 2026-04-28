@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "app-template",
-    "project_version":    "b7a79c2-dirty",
+    "project_version":    "43aa423-dirty",
     "project_path":       "D:/Github/Course-Project-1/firmware/esp32",
     "idf_path":           "C:/esp/v5.5.3/esp-idf",
     "build_dir":          "D:/Github/Course-Project-1/firmware/esp32/build",
@@ -70,7 +70,7 @@
             "managed_reqs": [],
             "managed_priv_reqs": [],
             "file": "D:/Github/Course-Project-1/firmware/esp32/build/esp-idf/ascon/libascon.a",
-            "sources": [ "D:/Github/Course-Project-1/firmware/esp32/components/ascon/core.c", "D:/Github/Course-Project-1/firmware/esp32/components/ascon/decrypt.c", "D:/Github/Course-Project-1/firmware/esp32/components/ascon/encrypt.c", "D:/Github/Course-Project-1/firmware/esp32/components/ascon/permutations.c", "D:/Github/Course-Project-1/firmware/esp32/components/ascon/printstate.c" ],
+            "sources": [ "D:/Github/Course-Project-1/firmware/esp32/components/ascon/core.c", "D:/Github/Course-Project-1/firmware/esp32/components/ascon/decrypt.c", "D:/Github/Course-Project-1/firmware/esp32/components/ascon/decrypt_tag4.c", "D:/Github/Course-Project-1/firmware/esp32/components/ascon/encrypt.c", "D:/Github/Course-Project-1/firmware/esp32/components/ascon/permutations.c", "D:/Github/Course-Project-1/firmware/esp32/components/ascon/printstate.c" ],
             "include_dirs": [ "." ]
         },
         "bootloader": {
@@ -1265,7 +1265,7 @@
             "dir": "D:/Github/Course-Project-1/firmware/esp32/main",
             "type": "LIBRARY",
             "lib": "__idf_main",
-            "reqs": [ "ascon", "lora_e32", "esp_driver_uart", "esp_driver_gpio", "esp_timer" ],
+            "reqs": [ "ascon", "lora_e32", "esp_driver_uart", "esp_driver_gpio", "esp_timer", "nvs_flash", "esp_wifi", "esp_event", "esp_netif" ],
             "priv_reqs": [],
             "managed_reqs": [],
             "managed_priv_reqs": [],
@@ -2979,7 +2979,7 @@
             "prefix": "idf",
             "dir": "D:/Github/Course-Project-1/firmware/esp32/main",
             "lib": "__idf_main",
-            "reqs": [ "ascon", "lora_e32", "esp_driver_uart", "esp_driver_gpio", "esp_timer" ],
+            "reqs": [ "ascon", "lora_e32", "esp_driver_uart", "esp_driver_gpio", "esp_timer", "nvs_flash", "esp_wifi", "esp_event", "esp_netif" ],
             "priv_reqs": [],
             "managed_reqs": [],
             "managed_priv_reqs": [],
