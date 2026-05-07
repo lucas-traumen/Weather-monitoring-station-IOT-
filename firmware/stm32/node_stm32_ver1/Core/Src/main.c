@@ -798,6 +798,7 @@ static void MX_RTC_Init(void)
           Error_Handler();
       }
   }
+#if 0
   /* USER CODE END Check_RTC_BKUP */
 
   /** Initialize RTC and set the Time and Date
@@ -820,7 +821,7 @@ static void MX_RTC_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN RTC_Init 2 */
-
+#endif
   /* USER CODE END RTC_Init 2 */
 
 }
