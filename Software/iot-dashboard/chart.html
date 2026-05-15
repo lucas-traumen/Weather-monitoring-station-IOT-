@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IoT Analytics</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+</head>
+<body>
+
+  <nav class="navbar">
+    <div class="nav-brand">
+      <div class="dot"></div>
+      IoT<span style="color:var(--cyan)">Sense</span>Hub
+    </div>
+    <div class="nav-links">
+      <a href="index.html" class="nav-tab">Dashboard</a>
+      <a href="chart.html" class="nav-tab active">Analytics</a>
+    </div>
+    <div class="nav-right">
+      <div class="conn-badge">
+        <div class="conn-dot live"></div>
+        <span>LIVE</span>
+      </div>
+    </div>
+  </nav>
+
+  <div class="container">
+
+    <div class="page-header charts-header">
+      <h1 class="page-title">Data <span>Analytics</span></h1>
+      <p class="page-sub">Last <span id="pointCount">--</span> records · Updates automatically via Realtime</p>
+    </div>
+
+    <!-- Summary stats -->
+    <div class="chart-stats-row">
+      <div class="stat-mini">
+        <span class="sm-label">🌡 Avg Temperature</span>
+        <span class="sm-val" id="avgTemp">-- °C</span>
+      </div>
+      <div class="stat-mini">
+        <span class="sm-label">💧 Avg Humidity</span>
+        <span class="sm-val" id="avgHum">-- %</span>
+      </div>
+      <div class="stat-mini">
+        <span class="sm-label">🔵 Avg Pressure</span>
+        <span class="sm-val" id="avgPres">-- hPa</span>
+      </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="chart-box">
+      <div class="chart-box-header">
+        <span class="chart-label" style="color:var(--col-temp)">Temperature — °C</span>
+        <span class="chart-live-val" id="liveTemp">--</span>
+      </div>
+      <div class="chart-canvas-wrap"><canvas id="tempChart"></canvas></div>
+    </div>
+
+    <div class="chart-box">
+      <div class="chart-box-header">
+        <span class="chart-label" style="color:var(--col-hum)">Humidity — %</span>
+        <span class="chart-live-val" id="liveHum">--</span>
+      </div>
+      <div class="chart-canvas-wrap"><canvas id="humidityChart"></canvas></div>
+    </div>
+
+    <div class="chart-box">
+      <div class="chart-box-header">
+        <span class="chart-label" style="color:var(--col-pres)">Pressure — hPa</span>
+        <span class="chart-live-val" id="livePres">--</span>
+      </div>
+      <div class="chart-canvas-wrap"><canvas id="pressureChart"></canvas></div>
+    </div>
+
+    <div class="chart-box">
+      <div class="chart-box-header">
+        <span class="chart-label" style="color:var(--col-bat)">Battery — V</span>
+        <span class="chart-live-val" id="liveBat">--</span>
+      </div>
+      <div class="chart-canvas-wrap"><canvas id="batteryChart"></canvas></div>
+    </div>
+
+    <div class="footer-strip">
+      <div class="updated-text">IoTSenseHub v2.0 · Chart.js</div>
+      <div class="updated-text">Showing <span id="shownCount" style="color:var(--text-2)">--</span> / <span id="totalCount" style="color:var(--text-2)">--</span> total records</div>
+    </div>
+
+  </div>
+
+  <script src="config.js"></script>
+  <script src="supabase.js"></script>
+  <script src="chart-render.js"></script>
+
+</body>
+</html>

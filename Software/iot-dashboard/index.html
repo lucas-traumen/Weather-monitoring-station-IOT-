@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IoT Weather Dashboard</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+</head>
+<body>
+
+  <nav class="navbar">
+    <div class="nav-brand">
+      <div class="dot"></div>
+      IoT<span style="color:var(--cyan)">Sense</span>Hub
+    </div>
+    <div class="nav-links">
+      <a href="index.html"   class="nav-tab active">Dashboard</a>
+      <a href="chart.html"   class="nav-tab">Analytics</a>
+    </div>
+    <div class="nav-right">
+      <div class="conn-badge">
+        <div class="conn-dot" id="connDot"></div>
+        <span id="connLabel">CONNECTING</span>
+      </div>
+    </div>
+  </nav>
+
+  <div class="container">
+
+    <div class="page-header">
+      <h1 class="page-title">Sensor <span>Monitor</span></h1>
+      <p class="page-sub">Real-time environmental data · Supabase Realtime</p>
+    </div>
+
+    <!-- Info strip -->
+    <div class="info-strip">
+      <div class="info-chip">
+        <span class="ic-label">Mode</span>
+        <span class="ic-val mode-sim" id="modeChip">--</span>
+      </div>
+      <div class="info-chip">
+        <span class="ic-label">Device</span>
+        <span class="ic-val" id="deviceChip">--</span>
+      </div>
+      <div class="info-chip">
+        <span class="ic-label">Records</span>
+        <span class="ic-val" id="recordsChip">--</span>
+      </div>
+      <div class="info-chip">
+        <span class="ic-label">Uptime</span>
+        <span class="ic-val live" id="uptimeChip">00:00:00</span>
+      </div>
+      <div class="info-chip">
+        <span class="ic-label">Last Update</span>
+        <span class="ic-val" id="lastUpdateChip">--</span>
+      </div>
+    </div>
+
+    <!-- Metric cards -->
+    <div class="grid">
+
+      <div class="card card-temp">
+        <div class="card-label">
+          <span class="card-label-icon">🌡</span>
+          <span class="card-label-text">Temperature</span>
+        </div>
+        <div class="card-value" id="temperature">--<span class="unit">°C</span></div>
+        <div class="card-sub" id="tempSub">—</div>
+      </div>
+
+      <div class="card card-hum">
+        <div class="card-label">
+          <span class="card-label-icon">💧</span>
+          <span class="card-label-text">Humidity</span>
+        </div>
+        <div class="card-value" id="humidity">--<span class="unit">%</span></div>
+        <div class="card-sub" id="humSub">—</div>
+      </div>
+
+      <div class="card card-pres">
+        <div class="card-label">
+          <span class="card-label-icon">🌀</span>
+          <span class="card-label-text">Pressure</span>
+        </div>
+        <div class="card-value" id="pressure">--<span class="unit">hPa</span></div>
+        <div class="card-sub" id="presSub">—</div>
+      </div>
+
+      <div class="card card-bat" id="batCard">
+        <div class="card-label">
+          <span class="card-label-icon">🔋</span>
+          <span class="card-label-text">Battery</span>
+        </div>
+        <div class="card-value" id="battery">--<span class="unit">V</span></div>
+        <div class="card-sub" id="batSub">—</div>
+      </div>
+
+      <div class="card card-trend">
+        <div class="card-label">
+          <span class="card-label-icon">📈</span>
+          <span class="card-label-text">Pressure Trend</span>
+        </div>
+        <div class="card-value" id="trend">--</div>
+        <div class="card-sub" id="trendSub">—</div>
+      </div>
+
+      <div class="card card-status" id="statusCard">
+        <div class="card-label">
+          <span class="card-label-icon">📡</span>
+          <span class="card-label-text">Status</span>
+        </div>
+        <div class="card-value" id="warning">--</div>
+        <div class="card-sub" id="statusSub">Monitoring active</div>
+      </div>
+
+    </div>
+
+    <div class="footer-strip">
+      <div class="updated-text">Updated: <span id="updated">--</span></div>
+      <div class="updated-text">IoTSenseHub v2.0 · Supabase Realtime</div>
+    </div>
+
+  </div>
+
+  <!-- Simulator đã tách riêng — KHÔNG load sim.js ở đây -->
+  <script src="config.js"></script>
+  <script src="supabase.js"></script>
+  <script src="app.js"></script>
+
+  <script>
+    // Info strip init
+    const modeEl = document.getElementById('modeChip');
+    modeEl.textContent = CONFIG.MODE;
+    modeEl.className = 'ic-val ' + (CONFIG.MODE === 'DEMO' ? 'mode-sim' : 'mode-real');
+
+    // Uptime
+    const _t0 = Date.now();
+    setInterval(() => {
+      const s  = Math.floor((Date.now() - _t0) / 1000);
+      const hh = String(Math.floor(s / 3600)).padStart(2,'0');
+      const mm = String(Math.floor((s % 3600) / 60)).padStart(2,'0');
+      const ss = String(s % 60).padStart(2,'0');
+      document.getElementById('uptimeChip').textContent = `${hh}:${mm}:${ss}`;
+    }, 1000);
+
+    // Record count
+    async function updateCount() {
+      try {
+        const { count } = await supabaseClient
+          .from(CONFIG.API.TABLE)
+          .select('*', { count:'exact', head:true });
+        document.getElementById('recordsChip').textContent = count ?? '--';
+      } catch {}
+    }
+    updateCount();
+    setInterval(updateCount, 10000);
+
+    // Flash + live indicator
+    ['temperature','humidity','pressure','battery','trend','warning'].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      new MutationObserver(() => {
+        el.classList.remove('flash');
+        void el.offsetWidth;
+        el.classList.add('flash');
+        document.getElementById('connDot')?.classList.add('live');
+        document.getElementById('connLabel').textContent = 'LIVE';
+
+        if (id === 'warning') {
+          const isStorm = el.textContent.includes('Storm') || el.textContent.includes('⚠');
+          document.getElementById('statusCard').classList.toggle('storm', isStorm);
+        }
+        if (id === 'battery') {
+          const val = parseFloat(el.textContent);
+          document.getElementById('batCard').classList.toggle('low', !isNaN(val) && val < 3.6);
+          const batSub = document.getElementById('batSub');
+          if (batSub && !isNaN(val)) {
+            batSub.textContent = val >= 4.0 ? '🟢 Full' : val >= 3.6 ? '🟡 Good' : '🔴 Low — charge soon';
+          }
+        }
+      }).observe(el, { childList:true, characterData:true, subtree:true });
+    });
+  </script>
+
+</body>
+</html>
