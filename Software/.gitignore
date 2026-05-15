@@ -1,0 +1,10 @@
+# ESP-IDF Build directory
+build/
+*/build/
+*/*/build/
+log/
+
+# Eclipse / IDE configuration files
+.cproject
+.project
+.settings/
