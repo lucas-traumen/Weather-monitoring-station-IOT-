@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IoT Simulator</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+</head>
+<body>
+
+  <!-- Simulator có navbar riêng, không xuất hiện trên web chính -->
+  <nav class="navbar">
+    <div class="nav-brand">
+      <div class="dot" style="background:var(--amber);box-shadow:0 0 10px var(--amber)"></div>
+      IoT<span style="color:var(--amber)">Sense</span>Hub
+      <span style="font-size:0.65rem;color:var(--text-3);margin-left:4px;font-weight:400">/ SIMULATOR</span>
+    </div>
+    <div class="nav-links">
+      <a href="index.html" class="nav-tab">← Back to Dashboard</a>
+    </div>
+    <div class="nav-right">
+      <div class="conn-badge">
+        <div class="conn-dot" id="connDot"></div>
+        <span id="connLabel">IDLE</span>
+      </div>
+    </div>
+  </nav>
+
+  <div class="container">
+
+    <div class="sim-header">
+      <h1>Data <span>Simulator</span></h1>
+      <p>
+        Giả lập ESP32 — gửi dữ liệu ảo lên Supabase mỗi 3 giây.<br>
+        Khi muốn dùng ESP32 thật: đóng tab này, đổi <code style="color:var(--amber)">CONFIG.MODE = "REAL"</code>
+        trong <code style="color:var(--text-2)">config.js</code>. ESP32 POST thẳng lên Supabase, web tự nhận qua Realtime.
+      </p>
+    </div>
+
+    <div class="sim-controls">
+      <button class="btn btn-pause" id="btnPause" onclick="handlePause()">⏸ Tạm dừng</button>
+      <button class="btn btn-danger" onclick="handleClear()">✕ Xóa Database</button>
+      <span class="sim-status" id="simStatus">● Khởi động...</span>
+    </div>
+
+    <div class="log-panel">
+      <div class="log-panel-header">Live Transmission Log</div>
+      <div class="log-entries" id="simLogs">
+        <div class="log-entry">
+          <span class="log-time">--:--:--</span>
+          <span style="color:var(--text-3)">Đang chờ gói tin đầu tiên...</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="config.js"></script>
+  <script src="supabase.js"></script>
+  <script src="sensor-api.js"></script>
+  <script src="sim.js"></script>
+
+  <script>
+    let paused      = false;
+    let packetCount = 0;
+
+    // Intercept pushSensorData để thêm pause + log UI
+    const _origPush = pushSensorData;
+    pushSensorData = async function(data) {
+      if (paused) return true;
+      const ok = await _origPush(data);
+      logPacket(ok, data);
+      return ok;
+    };
+
+    function logPacket(ok, data) {
+      const logDiv = document.getElementById('simLogs');
+      const time   = new Date().toLocaleTimeString('vi-VN', { hour12: false });
+
+      if (ok) {
+        packetCount++;
+        document.getElementById('simStatus').textContent = `● Đã gửi ${packetCount} gói`;
+        document.getElementById('connDot').classList.add('live');
+        document.getElementById('connLabel').textContent = 'TX';
+
+        const entry = document.createElement('div');
+        entry.className = 'log-entry';
+        entry.innerHTML =
+          `<span class="log-time">${time}</span>` +
+          `<span class="log-ok">✓ Gói #${packetCount}</span>` +
+          `<span class="log-data">${JSON.stringify({
+            temperature: data.temperature,
+            humidity:    data.humidity,
+            pressure:    data.pressure,
+            battery:     data.battery,
+          })}</span>`;
+        logDiv.insertBefore(entry, logDiv.firstChild);
+      } else {
+        const entry = document.createElement('div');
+        entry.className = 'log-entry';
+        entry.innerHTML =
+          `<span class="log-time">${time}</span>` +
+          `<span class="log-err">✗ Lỗi gửi — kiểm tra Console (F12)</span>`;
+        logDiv.insertBefore(entry, logDiv.firstChild);
+      }
+
+      while (logDiv.children.length > 40) logDiv.removeChild(logDiv.lastChild);
+    }
+
+    function handlePause() {
+      paused = !paused;
+      const btn = document.getElementById('btnPause');
+      const st  = document.getElementById('simStatus');
+      const dot = document.getElementById('connDot');
+
+      if (paused) {
+        btn.textContent   = '▶ Tiếp tục';
+        btn.style.cssText = 'border-color:var(--green);color:var(--green);background:var(--green-dim)';
+        st.textContent    = '⏸ Đã tạm dừng';
+        st.style.color    = 'var(--text-2)';
+        dot.classList.remove('live');
+        document.getElementById('connLabel').textContent = 'PAUSED';
+      } else {
+        btn.textContent   = '⏸ Tạm dừng';
+        btn.style.cssText = '';
+        st.textContent    = `● Đã gửi ${packetCount} gói`;
+        st.style.color    = 'var(--green)';
+        document.getElementById('connLabel').textContent = 'TX';
+      }
+    }
+
+    // FIX: dùng gte('created_at','1970-01-01') để match toàn bộ bảng
+    // not('id','is',null) bị Supabase anon key block trong một số cấu hình RLS
+    async function handleClear() {
+      const table = CONFIG.API.TABLE;
+      if (!confirm(`Xóa TOÀN BỘ dữ liệu trong bảng "${table}"?\nHành động này không thể hoàn tác.`)) return;
+
+      const st = document.getElementById('simStatus');
+      st.textContent = '⏳ Đang xóa...';
+      st.style.color = 'var(--amber)';
+
+      try {
+        const { error } = await supabaseClient
+          .from(table)
+          .delete()
+          .gte('created_at', '1970-01-01T00:00:00Z');
+
+        if (error) throw error;
+
+        packetCount = 0;
+        document.getElementById('simLogs').innerHTML =
+          '<div class="log-entry"><span class="log-ok">✓ Database đã được xóa sạch</span></div>';
+        st.textContent = '● Đang chạy';
+        st.style.color = 'var(--green)';
+
+      } catch (err) {
+        console.error('[Sim] Clear failed:', err);
+        st.textContent = `✗ Lỗi: ${err.message}`;
+        st.style.color = 'var(--red)';
+        // Nếu vẫn lỗi (RLS block DELETE), hướng dẫn chạy SQL tay
+        alert(
+          'Xóa thất bại!\n\n' +
+          'Nguyên nhân: RLS đang bật và block DELETE từ anon key.\n\n' +
+          'Giải pháp: Vào Supabase → SQL Editor → chạy:\n\n' +
+          `DELETE FROM ${table} WHERE created_at >= '1970-01-01';`
+        );
+      }
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('simStatus').textContent = '● Đang chạy';
+      document.getElementById('simStatus').style.color = 'var(--green)';
+      startSimulator();
+    });
+  </script>
+
+</body>
+</html>
