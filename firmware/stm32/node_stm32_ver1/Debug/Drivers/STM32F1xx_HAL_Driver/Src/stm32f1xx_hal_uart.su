@@ -52,8 +52,8 @@
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c:2928:23:HAL_UART_GetState	0	static
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c:2943:10:HAL_UART_GetError	0	static
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c:3236:19:UART_Start_Receive_IT	0	static
-../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c:1350:19:HAL_UART_Receive_IT	12	static
+../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c:1350:19:HAL_UART_Receive_IT	16	static
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c:1716:19:HAL_UARTEx_ReceiveToIdle_IT	24	static,ignoring_inline_asm
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c:3271:19:UART_Start_Receive_DMA	24	static,ignoring_inline_asm
-../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c:1444:19:HAL_UART_Receive_DMA	12	static
+../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c:1444:19:HAL_UART_Receive_DMA	16	static
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c:1776:19:HAL_UARTEx_ReceiveToIdle_DMA	24	static,ignoring_inline_asm

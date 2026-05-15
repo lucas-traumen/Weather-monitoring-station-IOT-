@@ -3,25 +3,20 @@
 
 cmake_minimum_required(VERSION 3.5)
 
-# If CMAKE_DISABLE_SOURCE_CHANGES is set to true and the source directory is an
-# existing directory in our source tree, calling file(MAKE_DIRECTORY) on it
-# would cause a fatal error, even though it would be a no-op.
-if(NOT EXISTS "C:/esp/v5.5.3/esp-idf/components/bootloader/subproject")
-  file(MAKE_DIRECTORY "C:/esp/v5.5.3/esp-idf/components/bootloader/subproject")
-endif()
 file(MAKE_DIRECTORY
-  "D:/Github/Course-Project-1/firmware/esp32/build/bootloader"
-  "D:/Github/Course-Project-1/firmware/esp32/build/bootloader-prefix"
-  "D:/Github/Course-Project-1/firmware/esp32/build/bootloader-prefix/tmp"
-  "D:/Github/Course-Project-1/firmware/esp32/build/bootloader-prefix/src/bootloader-stamp"
-  "D:/Github/Course-Project-1/firmware/esp32/build/bootloader-prefix/src"
-  "D:/Github/Course-Project-1/firmware/esp32/build/bootloader-prefix/src/bootloader-stamp"
+  "/home/lucas/.espressif/v6.0.1/esp-idf/components/bootloader/subproject"
+  "/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/bootloader"
+  "/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/bootloader-prefix"
+  "/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/bootloader-prefix/tmp"
+  "/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/bootloader-prefix/src/bootloader-stamp"
+  "/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/bootloader-prefix/src"
+  "/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/bootloader-prefix/src/bootloader-stamp"
 )
 
 set(configSubDirs )
 foreach(subDir IN LISTS configSubDirs)
-    file(MAKE_DIRECTORY "D:/Github/Course-Project-1/firmware/esp32/build/bootloader-prefix/src/bootloader-stamp/${subDir}")
+    file(MAKE_DIRECTORY "/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/bootloader-prefix/src/bootloader-stamp/${subDir}")
 endforeach()
 if(cfgdir)
-  file(MAKE_DIRECTORY "D:/Github/Course-Project-1/firmware/esp32/build/bootloader-prefix/src/bootloader-stamp${cfgdir}") # cfgdir has leading slash
+  file(MAKE_DIRECTORY "/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/bootloader-prefix/src/bootloader-stamp${cfgdir}") # cfgdir has leading slash
 endif()

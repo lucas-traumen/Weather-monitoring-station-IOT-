@@ -10,7 +10,7 @@
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rtc.c:651:13:HAL_RTC_MspInit	1
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rtc.c:666:13:HAL_RTC_MspDeInit	1
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rtc.c:704:19:HAL_RTC_SetTime	8
-../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rtc.c:803:19:HAL_RTC_GetTime	25
+../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rtc.c:803:19:HAL_RTC_GetTime	26
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rtc.c:914:19:HAL_RTC_SetDate	9
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rtc.c:1028:19:HAL_RTC_GetDate	5
 ../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rtc.c:1093:19:HAL_RTC_SetAlarm	8

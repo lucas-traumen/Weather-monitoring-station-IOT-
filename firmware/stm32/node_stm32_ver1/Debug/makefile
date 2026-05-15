@@ -1,6 +1,6 @@
 ################################################################################
 # Automatically-generated file. Do not edit!
-# Toolchain: GNU Tools for STM32 (13.3.rel1)
+# Toolchain: GNU Tools for STM32 (14.3.rel1)
 ################################################################################
 
 -include ../makefile.init
@@ -64,8 +64,8 @@ all: main-build
 main-build: node_stm32_ver1.elf secondary-outputs
 
 # Tool invocations
-node_stm32_ver1.elf node_stm32_ver1.map: $(OBJS) $(USER_OBJS) D:\Github\Course-Project-1\firmware\stm32\node_stm32_ver1\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "node_stm32_ver1.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"D:\Github\Course-Project-1\firmware\stm32\node_stm32_ver1\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="node_stm32_ver1.map" -Wl,--gc-sections -static -fshort-enums --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+node_stm32_ver1.elf node_stm32_ver1.map: $(OBJS) $(USER_OBJS) /home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "node_stm32_ver1.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="node_stm32_ver1.map" -Wl,--gc-sections -static -fshort-enums --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

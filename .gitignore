@@ -1,1 +1,11 @@
-Hardware/node_sensor/node_sensor-backups/
+Hardware/node_sensor/node_sensor-backups
+# ESP-IDF Build directory
+build/
+*/build/
+*/*/build/
+log/
+
+# Eclipse / IDE configuration files
+.cproject
+.project
+.settings//
