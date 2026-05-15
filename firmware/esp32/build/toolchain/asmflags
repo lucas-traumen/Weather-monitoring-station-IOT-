@@ -1,0 +1,5 @@
+-mlongcalls
+-fno-builtin-memcpy
+-fno-builtin-memset
+-fno-builtin-bzero
+"-specs=/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/specs/picolibc.specs"
