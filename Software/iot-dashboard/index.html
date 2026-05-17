@@ -3,9 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>IoT Weather Dashboard</title>
+  <title>IoT Weather Dashboard & MLOps</title>
   <link rel="stylesheet" href="style.css" />
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+  <style>
+    /* Hiệu ứng chớp nháy nhẹ cho biểu tượng ăng-ten */
+    @keyframes pulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.9); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+  </style>
 </head>
 <body>
 
@@ -15,7 +23,7 @@
       IoT<span style="color:var(--cyan)">Sense</span>Hub
     </div>
     <div class="nav-links">
-      <a href="index.html"   class="nav-tab active">Dashboard</a>
+      <a href="index.html"   class="nav-tab active">Dashboard & MLOps</a>
       <a href="chart.html"   class="nav-tab">Analytics</a>
     </div>
     <div class="nav-right">
@@ -29,15 +37,14 @@
   <div class="container">
 
     <div class="page-header">
-      <h1 class="page-title">Sensor <span>Monitor</span></h1>
-      <p class="page-sub">Real-time environmental data · Supabase Realtime</p>
+      <h1 class="page-title">Sensor <span>Monitor & MLOps Engine</span></h1>
+      <p class="page-sub">Real-time Environmental Data & Edge AI Operations</p>
     </div>
 
-    <!-- Info strip -->
     <div class="info-strip">
       <div class="info-chip">
         <span class="ic-label">Mode</span>
-        <span class="ic-val mode-sim" id="modeChip">--</span>
+        <span class="ic-val mode-real" id="modeChip">REAL</span>
       </div>
       <div class="info-chip">
         <span class="ic-label">Device</span>
@@ -57,84 +64,121 @@
       </div>
     </div>
 
-    <!-- Metric cards -->
-    <div class="grid">
-
-      <div class="card card-temp">
-        <div class="card-label">
-          <span class="card-label-icon">🌡</span>
-          <span class="card-label-text">Temperature</span>
+    <div style="background: var(--surface2, #1e1e24); border: 1px solid var(--border, #333); border-left: 4px solid var(--cyan, #00f0ff); border-radius: var(--r-sm, 8px); padding: 14px 20px; margin-bottom: 24px; display: flex; align-items: center; justify-content: space-between; font-family: var(--font-mono, monospace);">
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <span style="font-size: 1.4rem; animation: pulse 2s infinite;">📡</span>
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <span style="color: var(--text-2, #888); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px;">Telemetry Link Status</span>
+          <span style="color: var(--text, #ddd); font-size: 0.9rem;">Kết nối Node Cảm Biến LoRa</span>
         </div>
+      </div>
+      <div style="background: var(--bg, #0f0f13); padding: 8px 16px; border-radius: 20px; border: 1px solid var(--border, #333); transition: all 0.3s ease;">
+        <strong id="sensor-status-text" style="font-size: 0.85rem; letter-spacing: 0.5px; color: var(--text-2);">Đang phân tích...</strong>
+      </div>
+    </div>
+
+    <h2 style="font-size:0.9rem; font-family:var(--font-mono); color:var(--text-2); margin-bottom:12px; letter-spacing:0.1em; text-transform:uppercase;">➔ Môi trường thực tế (Sensor Metrics)</h2>
+    <div class="grid" style="margin-bottom: 24px;">
+      
+      <div class="card card-temp">
+        <div class="card-label"><span class="card-label-icon">🌡</span><span class="card-label-text">Temperature</span></div>
         <div class="card-value" id="temperature">--<span class="unit">°C</span></div>
         <div class="card-sub" id="tempSub">—</div>
       </div>
 
       <div class="card card-hum">
-        <div class="card-label">
-          <span class="card-label-icon">💧</span>
-          <span class="card-label-text">Humidity</span>
-        </div>
+        <div class="card-label"><span class="card-label-icon">💧</span><span class="card-label-text">Humidity</span></div>
         <div class="card-value" id="humidity">--<span class="unit">%</span></div>
         <div class="card-sub" id="humSub">—</div>
       </div>
 
       <div class="card card-pres">
-        <div class="card-label">
-          <span class="card-label-icon">🌀</span>
-          <span class="card-label-text">Pressure</span>
-        </div>
+        <div class="card-label"><span class="card-label-icon">🌀</span><span class="card-label-text">Pressure</span></div>
         <div class="card-value" id="pressure">--<span class="unit">hPa</span></div>
         <div class="card-sub" id="presSub">—</div>
       </div>
-
-      <div class="card card-bat" id="batCard">
+      <div class="card card-board-temp">
         <div class="card-label">
-          <span class="card-label-icon">🔋</span>
-          <span class="card-label-text">Battery</span>
+          <span class="card-label-icon">🎛️</span>
+          <span class="card-label-text">Board Temp</span>
         </div>
+        <div class="card-value" id="board_temp">--<span class="unit">°C</span></div>
+        <div class="card-sub" id="boardTempSub">Nhiệt độ phần cứng mạch</div>
+      </div>
+      <div class="card card-bat" id="batCard">
+        <div class="card-label"><span class="card-label-icon">🔋</span><span class="card-label-text">Battery</span></div>
         <div class="card-value" id="battery">--<span class="unit">V</span></div>
         <div class="card-sub" id="batSub">—</div>
       </div>
 
       <div class="card card-trend">
-        <div class="card-label">
-          <span class="card-label-icon">📈</span>
-          <span class="card-label-text">Pressure Trend</span>
-        </div>
+        <div class="card-label"><span class="card-label-icon">📈</span><span class="card-label-text">Pressure Trend</span></div>
         <div class="card-value" id="trend">--</div>
         <div class="card-sub" id="trendSub">—</div>
       </div>
 
       <div class="card card-status" id="statusCard">
-        <div class="card-label">
-          <span class="card-label-icon">📡</span>
-          <span class="card-label-text">Status</span>
-        </div>
-        <div class="card-value" id="warning">--</div>
+        <div class="card-label"><span class="card-label-icon">📡</span><span class="card-label-text">AI Alert System</span></div>
+        <div class="card-value" id="warning" style="font-size: 1.2rem;">--</div>
         <div class="card-sub" id="statusSub">Monitoring active</div>
       </div>
-
     </div>
 
-    <div class="footer-strip">
+    <h2 style="font-size:0.9rem; font-family:var(--font-mono); color:var(--text-2); margin-bottom:12px; letter-spacing:0.1em; text-transform:uppercase;">➔ Nội tâm & Dự đoán toán học AI (Edge AI Telemetry)</h2>
+    <div class="grid" style="margin-bottom: 24px;">
+      <div class="card" style="--card-col: var(--col-pres)">
+        <div class="card-label"><span class="card-label-icon">📐</span><span class="card-label-text">β Pressure (Slope)</span></div>
+        <div class="card-value" id="beta_pressure" style="font-size: 1.8rem; color:var(--text);">--</div>
+        <div class="card-sub">Độ dốc áp suất khí quyển / 10 phút</div>
+      </div>
+
+      <div class="card" style="--card-col: var(--col-hum)">
+        <div class="card-label"><span class="card-label-icon">📐</span><span class="card-label-text">β Humidity (Slope)</span></div>
+        <div class="card-value" id="beta_humidity" style="font-size: 1.8rem; color:var(--text);">--</div>
+        <div class="card-sub">Độ dốc ẩm độ tương đối / 10 phút</div>
+      </div>
+
+      <div class="card" style="--card-col: var(--col-temp)">
+        <div class="card-label"><span class="card-label-icon">🔮</span><span class="card-label-text">Predicted Temp (1h)</span></div>
+        <div class="card-value" id="predicted_temp" style="font-size: 1.8rem; color:var(--cyan);">--<span class="unit">°C</span></div>
+        <div class="card-sub" id="predictedSub">Tiên lượng nhiệt độ bằng mô hình SLR</div>
+      </div>
+    </div>  
+
+    <h2 style="font-size:0.9rem; font-family:var(--font-mono); color:var(--text-2); margin-bottom:12px; letter-spacing:0.1em; text-transform:uppercase;">➔ Trung tâm điều khiển Vòng đời MLOps & OTA</h2>
+    <div class="card" style="--card-col: var(--amber); background: var(--surface2); padding: 24px;">
+      <div class="card-label">
+        <span class="card-label-icon">🚀</span>
+        <span class="card-label-text" style="color: var(--amber);">Over-The-Air (OTA) Remote Deployment</span>
+      </div>
+      <p style="font-size: 0.8rem; color: var(--text-2); margin-bottom: 16px; font-family: var(--font-mono);">
+        Tải trực tiếp file firmware (.bin) từ máy tính lên hệ thống đám mây để tự động phân phối xuống thiết bị Gateway thực địa.
+      </p>
+      
+      <div class="ota-form" style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
+        <input type="file" id="otaFileInput" accept=".bin" 
+               style="flex: 1; min-width: 280px; padding: 10px 14px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 0.8rem;" />
+        
+        <button class="btn" id="btnTriggerOta" onclick="uploadAndDeployFirmware()" 
+                style="background: var(--amber-dim); border-color: var(--amber); color: var(--amber); padding: 11px 22px; border-radius: var(--r-sm); font-weight: 600; cursor: pointer; transition: all 0.2s;">
+          📁 Tải lên & Phát lệnh
+        </button>
+      </div>
+      <div id="otaStatusLog" style="margin-top: 12px; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-3);">Trạng thái: Sẵn sàng nhận file .bin</div>
+    </div>
+
+    <div class="footer-strip" style="margin-top: 24px;">
       <div class="updated-text">Updated: <span id="updated">--</span></div>
-      <div class="updated-text">IoTSenseHub v2.0 · Supabase Realtime</div>
+      <div class="updated-text">IoTSenseHub v3.0 · MLOps Pipeline Ready</div>
     </div>
-
   </div>
 
-  <!-- Simulator đã tách riêng — KHÔNG load sim.js ở đây -->
   <script src="config.js"></script>
   <script src="supabase.js"></script>
   <script src="app.js"></script>
 
   <script>
-    // Info strip init
-    const modeEl = document.getElementById('modeChip');
-    modeEl.textContent = CONFIG.MODE;
-    modeEl.className = 'ic-val ' + (CONFIG.MODE === 'DEMO' ? 'mode-sim' : 'mode-real');
-
-    // Uptime
+    // 1. Khởi tạo đồng hồ đếm Uptime
     const _t0 = Date.now();
     setInterval(() => {
       const s  = Math.floor((Date.now() - _t0) / 1000);
@@ -144,7 +188,7 @@
       document.getElementById('uptimeChip').textContent = `${hh}:${mm}:${ss}`;
     }, 1000);
 
-    // Record count
+    // 2. Tính tổng số bản ghi
     async function updateCount() {
       try {
         const { count } = await supabaseClient
@@ -156,24 +200,33 @@
     updateCount();
     setInterval(updateCount, 10000);
 
-    // Flash + live indicator
-    ['temperature','humidity','pressure','battery','trend','warning'].forEach(id => {
+    // 3. Hiệu ứng Flash & Cảnh báo UI
+    ['temperature','humidity','pressure','battery','trend','warning','beta_pressure','beta_humidity','predicted_temp','board_temp'].forEach(id => {
       const el = document.getElementById(id);
       if (!el) return;
       new MutationObserver(() => {
         el.classList.remove('flash');
-        void el.offsetWidth;
+        void el.offsetWidth; // Kích hoạt lại animation
         el.classList.add('flash');
+        
         document.getElementById('connDot')?.classList.add('live');
         document.getElementById('connLabel').textContent = 'LIVE';
 
+        // Đổi màu nền thẻ Alert khi có cảnh báo
         if (id === 'warning') {
-          const isStorm = el.textContent.includes('Storm') || el.textContent.includes('⚠');
-          document.getElementById('statusCard').classList.toggle('storm', isStorm);
+          const isStorm = el.textContent.includes('DÔNG') || el.textContent.includes('⚠');
+          const isFrost = el.textContent.includes('SƯƠNG') || el.textContent.includes('❄');
+          const card = document.getElementById('statusCard');
+          if(card) {
+             card.classList.toggle('storm', isStorm);
+             card.classList.toggle('frost', isFrost && !isStorm);
+          }
         }
+        // Hiệu ứng Pin
         if (id === 'battery') {
           const val = parseFloat(el.textContent);
-          document.getElementById('batCard').classList.toggle('low', !isNaN(val) && val < 3.6);
+          const batCard = document.getElementById('batCard');
+          if(batCard) batCard.classList.toggle('low', !isNaN(val) && val < 3.6);
           const batSub = document.getElementById('batSub');
           if (batSub && !isNaN(val)) {
             batSub.textContent = val >= 4.0 ? '🟢 Full' : val >= 3.6 ? '🟡 Good' : '🔴 Low — charge soon';
@@ -182,6 +235,5 @@
       }).observe(el, { childList:true, characterData:true, subtree:true });
     });
   </script>
-
 </body>
 </html>

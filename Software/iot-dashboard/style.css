@@ -335,3 +335,13 @@ body{
   border:1px solid var(--border);transition:all 0.15s var(--ease);
 }
 .nav-link:hover{color:var(--cyan);border-color:var(--cyan);background:var(--cyan-dim);}
+/* Hiệu ứng hiển thị thẻ cảnh báo Sương giá (Edge AI) */
+.card-status.frost {
+  --card-col: var(--cyan);
+  border-color: rgba(0, 229, 255, 0.4);
+  background: rgba(0, 229, 255, 0.05);
+}
+.card-status.frost .card-value {
+  color: var(--cyan);
+  animation: breathe 2s ease-in-out infinite;
+}

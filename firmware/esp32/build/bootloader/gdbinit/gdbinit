@@ -1,2 +1,2 @@
-source D:/Github/Course-Project-1/firmware/esp32/build/bootloader/gdbinit/symbols
-source D:/Github/Course-Project-1/firmware/esp32/build/bootloader/gdbinit/connect
+source /home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/bootloader/gdbinit/symbols
+source /home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build/bootloader/gdbinit/connect

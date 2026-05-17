@@ -3,10 +3,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <time.h>
+#include <sys/time.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/timers.h"
+#include "freertos/queue.h"
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
@@ -18,36 +23,43 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_http_client.h"
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
+#include "esp_crt_bundle.h"
+#include "esp_sntp.h"
 #include "nvs_flash.h"
+#include "nvs.h"
+#include "cJSON.h"
+#include <bootloader_common.h>
 
-/*
- * ASCON component files needed:
- *   components/ascon/api.h
- *   components/ascon/crypto_aead.h          <-- add this header
- *   components/ascon/decrypt_tag4.c         <-- add this source
- *
- * crypto_aead_decrypt_tag4() verifies only the first 4 bytes of the ASCON tag.
- */
 #include "crypto_aead.h"
 
 /*
- * ESP32 gateway for EBYTE E32-433T30D UART LoRa module.
+ * ════════════════════════════════════════════════════════════════════
+ *  ROOT CA CERT NHÚNG TRỰC TIẾP (TLS DualLayer Strategy)
  *
- * - Dynamically configures E32 in Mode 3/Sleep at 9600 8N1.
- * - Switches E32 to Mode 0/Normal and receives STM32 frames at 115200 8N1.
- * - Connects to WiFi STA.
- * - Parses STM32 frame:
- *      4 bytes frame_counter little-endian
- *      9 bytes ciphertext
- *      4 bytes truncated ASCON tag
- *   Total: 17 bytes.
+ *  File supabase_root_ca.pem được CMakeLists.txt biên dịch
+ *  thành symbol nhị phân và nhúng vào flash firmware.
  *
- * IMPORTANT PIN NOTE:
- * On classic ESP32-WROOM/DevKit, GPIO34..GPIO39 are input-only.
- * Do NOT put M0/M1 on GPIO37/GPIO38 if your chip is classic ESP32.
- * If you are using ESP32-S3 and your board routes GPIO37/38/39, these pins can work.
+ *  Cách dùng:
+ *    .ca_cert_pem = (const char *)supabase_root_ca_pem_start
+ *
+ *  Nếu chưa có file .pem, TẠM THỜI comment 2 dòng extern dưới và
+ *  dùng ONLY_BUNDLE_MODE (xem #define bên dưới).
+ * ════════════════════════════════════════════════════════════════════
  */
+extern const char supabase_root_ca_pem_start[] asm("_binary_supabase_root_ca_pem_start");
+extern const char supabase_root_ca_pem_end[]   asm("_binary_supabase_root_ca_pem_end");
 
+/*
+ * Đặt thành 1 nếu chưa có file supabase_root_ca.pem:
+ *   chỉ dùng crt_bundle + cross-signed verify (sdkconfig.defaults)
+ * Đặt thành 0 khi đã có file .pem (khuyến nghị, chắc chắn nhất).
+ */
+#define TLS_ONLY_BUNDLE_MODE  0
+
+/* ─────────────────────────── PIN / UART CONFIG ─────────────────────────── */
 #define E32_UART_NUM          UART_NUM_2
 #define E32_UART_TX_PIN       GPIO_NUM_17
 #define E32_UART_RX_PIN       GPIO_NUM_18
@@ -55,792 +67,600 @@
 #define E32_M1_PIN            GPIO_NUM_38
 #define E32_AUX_PIN           GPIO_NUM_39
 
-#define E32_CFG_BAUDRATE      9600
-#define E32_RUN_BAUDRATE      115200
-
-#define E32_UART_RX_BUF       2048
-#define E32_UART_TX_BUF       512
-
 #define E32_FRAME_LEN         17
 #define E32_FRAME_IDLE_MS     150
-#define E32_AUX_TIMEOUT_MS    3000
-#define E32_CFG_TIMEOUT_MS    1000
-
 #define SENSOR_PLAINTEXT_LEN  9
 #define ASCON_TAG4_LEN        4
 #define ASCON_INPUT_LEN       (SENSOR_PLAINTEXT_LEN + ASCON_TAG4_LEN)
 
-/*
- * WiFi config.
- * Replace these with your real WiFi credentials before flashing.
- */
-#define WIFI_SSID             "LUCAS"
-#define WIFI_PASS             "12345678"
-#define WIFI_MAX_RETRY        5
-
-#define WIFI_CONNECTED_BIT    BIT0
-#define WIFI_FAIL_BIT         BIT1
-
-/* Target E32 working parameters: C0 00 17 3A 17 44
- * ADDR   = 0x0017
- * SPEED  = 0x3A = 8N1 + local UART 115200 + air rate 2.4 kbps
- * CHAN   = 0x17 = 433 MHz for E32-433 series
- * OPTION = 0x44 = transparent + push-pull + 250 ms wake + FEC on + 30 dBm
- */
+/* ─────────────────────────── E32 LORA CONFIG ───────────────────────────── */
 #define E32_CFG_ADDH          0x00
 #define E32_CFG_ADDL          0x17
 #define E32_CFG_SPEED         0x3A
 #define E32_CFG_CHAN          0x17
 #define E32_CFG_OPTION        0x44
-
 #define E32_CMD_WRITE_FLASH   0xC0
-#define E32_CMD_READ_CFG      0xC1
-#define E32_CMD_WRITE_RAM     0xC2
 
+/* ─────────────────────────── WIFI CONFIG ───────────────────────────────── */
+typedef struct { const char *ssid; const char *pass; } wifi_cred_t;
+static const wifi_cred_t s_wifi_list[] = {
+    {"Truong Lung",   "12345678"},
+    {"LUCAS",         "12345678"},
+    {"WIFI_DU_PHONG", "matkhauduphong"}
+};
+static const int NUM_WIFIS = sizeof(s_wifi_list) / sizeof(s_wifi_list[0]);
+static int           s_wifi_idx       = 0;
+static TimerHandle_t s_wifi_timer     = NULL;
+static bool          s_wifi_connected = false;
+#define WIFI_CONNECTED_BIT    BIT0
 
+/* ─────────────────────────── SUPABASE CONFIG ───────────────────────────── */
+#define SUPABASE_URL      "https://hbuluhjjfivezrrxesaz.supabase.co"
+#define SUPABASE_TABLE    "weather_logs"
+#define SUPABASE_ANON_KEY \
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." \
+    "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhidWx1" \
+    "aGpqZml2ZXpycnhlc2F6Iiwicm9sZSI6ImFub24i" \
+    "LCJpYXQiOjE3Nzg1MDE4MDksImV4cCI6MjA5NDA3" \
+    "NzgwOX0.KhjB0T-8Yy34P3p37XipEutwVfraabsG274NL_88J4Q"
+#define DEVICE_ID         "ESP32_LORA_GW"
+
+#define HTTP_POST_TIMEOUT_MS    8000
+#define HTTP_GET_TIMEOUT_MS    10000
+#define HTTP_OTA_TIMEOUT_MS    60000
+
+/* ─────────────────────────── MLOps GLOBALS ─────────────────────────────── */
+#define AI_BUFFER_SIZE  6
+
+typedef struct {
+    float pressure;
+    float humidity;
+    float temperature;
+} AI_DataPoint_t;
+
+static QueueHandle_t s_ai_data_queue = NULL;
+
+static bool  g_storm_warning  = false;
+static bool  g_frost_warning  = false;
+static float g_beta_press     = 0.0f;
+static float g_beta_hum       = 0.0f;
+static float g_beta_temp      = 0.0f;
+static float g_predicted_temp = 0.0f;
+
+float THRESHOLD_BETA_PRESS_STORM = -0.05f;
+float THRESHOLD_BETA_HUM_STORM   =  0.05f;
+float THRESHOLD_BETA_TEMP_FROST  = -0.10f;
+
+/* ─────────────────────────── SENSOR STRUCTS ────────────────────────────── */
 #define ERR_SHT30   (1U << 0)
 #define ERR_BMP388  (1U << 1)
 #define ERR_VBAT    (1U << 2)
 
 typedef struct __attribute__((packed)) {
-    int16_t  env_temp_raw;     /* temperature * 100 */
-    uint16_t env_hum_raw;      /* humidity * 100 */
-    uint16_t air_press_raw;    /* (pressure_hPa - 900.0) * 100 */
-    int8_t   board_temp_raw;   /* degC */
-    uint8_t  batt_volt_raw;    /* raw/reserved */
+    int16_t  env_temp_raw;
+    uint16_t env_hum_raw;
+    uint16_t air_press_raw;
+    int8_t   board_temp_raw;
+    uint8_t  batt_volt_raw;
     uint8_t  health_flag;
 } SensorPayloadRaw_t;
 
 typedef struct {
     uint32_t frame_counter;
-
-    SensorPayloadRaw_t raw;
-
-    float env_temp_c;
-    float env_humidity_pct;
-    float air_pressure_hpa;
-    int   board_temp_c;
-    uint8_t battery_raw;
-
-    bool sht30_ok;
-    bool bmp388_ok;
-    bool vbat_ok;
-    bool payload_ok;
-
-    char health_text[64];
+    float    env_temp_c;
+    float    env_humidity_pct;
+    float    air_pressure_hpa;
+    float    board_temp_c;
+    float    battery_volt;
+    bool     sht30_ok;
+    bool     bmp388_ok;
+    bool     payload_ok;
 } SensorDecodedData_t;
 
-static const char *TAG = "E32_GATEWAY";
-
+static const char *TAG = "WEATHER_GATEWAY";
 static EventGroupHandle_t s_wifi_event_group = NULL;
-static int s_wifi_retry_num = 0;
 
 static const uint8_t ASCON_SECRET_KEY[16] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
 
-typedef enum {
-    E32_MODE_NORMAL = 0,     /* M1=0, M0=0 */
-    E32_MODE_WAKEUP = 1,     /* M1=0, M0=1 */
-    E32_MODE_POWER_SAVE = 2, /* M1=1, M0=0 */
-    E32_MODE_SLEEP = 3       /* M1=1, M0=1, config mode */
-} e32_mode_t;
-
-static int64_t now_ms(void)
+/* ═══════════════════════════════════════════════════════════════════
+ * HELPER: Tạo esp_http_client_config_t đúng chuẩn TLS cho Supabase
+ *
+ * Chiến lược DualLayer:
+ *   [Layer 1] ca_cert_pem  → cert cụ thể của Supabase (chắc chắn nhất)
+ *   [Layer 2] crt_bundle_attach → Mozilla bundle làm dự phòng
+ *
+ * Khi TLS_ONLY_BUNDLE_MODE=1 (chưa có .pem):
+ *   Chỉ dùng bundle + CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY
+ * ═══════════════════════════════════════════════════════════════════ */
+static void tls_cfg_fill(esp_http_client_config_t *cfg)
 {
-    return esp_timer_get_time() / 1000LL;
-}
-
-static void dump_hex(const char *prefix, const uint8_t *data, size_t len)
-{
-    printf("%s", prefix);
-    for (size_t i = 0; i < len; ++i) {
-        printf(" %02X", data[i]);
-    }
-    printf("\n");
-}
-
-/* ----------------------------- WiFi STA ----------------------------- */
-
-static void wifi_event_handler(void *arg,
-                               esp_event_base_t event_base,
-                               int32_t event_id,
-                               void *event_data)
-{
-    (void)arg;
-
-    if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_START)) {
-        esp_wifi_connect();
-    } else if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_DISCONNECTED)) {
-        if (s_wifi_retry_num < WIFI_MAX_RETRY) {
-            esp_wifi_connect();
-            s_wifi_retry_num++;
-            ESP_LOGW(TAG, "retry WiFi connection, attempt=%d", s_wifi_retry_num);
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
-    } else if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_GOT_IP)) {
-        const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "WiFi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        s_wifi_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
-static esp_err_t wifi_init_sta(void)
-{
-    esp_err_t ret;
-
-    s_wifi_event_group = xEventGroupCreate();
-    if (s_wifi_event_group == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    ret = nvs_flash_init();
-    if ((ret == ESP_ERR_NVS_NO_FREE_PAGES) || (ret == ESP_ERR_NVS_NEW_VERSION_FOUND)) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_RETURN_ON_ERROR(ret, TAG, "nvs init failed");
-
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "esp_netif_init failed");
-    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event loop failed");
-
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init failed");
-
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-
-    ESP_RETURN_ON_ERROR(
-        esp_event_handler_instance_register(
-            WIFI_EVENT,
-            ESP_EVENT_ANY_ID,
-            &wifi_event_handler,
-            NULL,
-            &instance_any_id
-        ),
-        TAG,
-        "wifi event register failed"
-    );
-
-    ESP_RETURN_ON_ERROR(
-        esp_event_handler_instance_register(
-            IP_EVENT,
-            IP_EVENT_STA_GOT_IP,
-            &wifi_event_handler,
-            NULL,
-            &instance_got_ip
-        ),
-        TAG,
-        "ip event register failed"
-    );
-
-    wifi_config_t wifi_config = {0};
-    strncpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password) - 1);
-
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.pmf_cfg.capable = true;
-    wifi_config.sta.pmf_cfg.required = false;
-
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set wifi mode failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "set wifi config failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
-
-    ESP_LOGI(TAG, "WiFi STA started, connecting to %s", WIFI_SSID);
-
-    const EventBits_t bits = xEventGroupWaitBits(
-        s_wifi_event_group,
-        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-        pdFALSE,
-        pdFALSE,
-        pdMS_TO_TICKS(15000)
-    );
-
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "WiFi connected");
-        return ESP_OK;
-    }
-
-    if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGE(TAG, "WiFi failed to connect");
-        return ESP_FAIL;
-    }
-
-    ESP_LOGW(TAG, "WiFi connection timeout; continuing LoRa RX");
-    return ESP_ERR_TIMEOUT;
-}
-
-/* ----------------------------- E32 helpers ----------------------------- */
-
-static bool cfg_matches_target(const uint8_t cfg[6])
-{
-    return (cfg[1] == E32_CFG_ADDH) &&
-           (cfg[2] == E32_CFG_ADDL) &&
-           (cfg[3] == E32_CFG_SPEED) &&
-           (cfg[4] == E32_CFG_CHAN) &&
-           (cfg[5] == E32_CFG_OPTION);
-}
-
-static esp_err_t e32_wait_aux_high(uint32_t timeout_ms, const char *where)
-{
-    const int64_t start = now_ms();
-
-    while (gpio_get_level(E32_AUX_PIN) == 0) {
-        if ((uint32_t)(now_ms() - start) >= timeout_ms) {
-            ESP_LOGE(TAG, "AUX timeout at %s", where);
-            return ESP_ERR_TIMEOUT;
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
-    return ESP_OK;
-}
-
-static esp_err_t e32_set_mode(e32_mode_t mode)
-{
-    int m0 = 0;
-    int m1 = 0;
-
-    switch (mode) {
-    case E32_MODE_NORMAL:
-        m0 = 0;
-        m1 = 0;
-        break;
-    case E32_MODE_WAKEUP:
-        m0 = 1;
-        m1 = 0;
-        break;
-    case E32_MODE_POWER_SAVE:
-        m0 = 0;
-        m1 = 1;
-        break;
-    case E32_MODE_SLEEP:
-        m0 = 1;
-        m1 = 1;
-        break;
-    default:
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    ESP_RETURN_ON_ERROR(e32_wait_aux_high(E32_AUX_TIMEOUT_MS, "before mode switch"), TAG, "AUX busy");
-
-    gpio_set_level(E32_M0_PIN, m0);
-    gpio_set_level(E32_M1_PIN, m1);
-
-    vTaskDelay(pdMS_TO_TICKS(5));
-    ESP_RETURN_ON_ERROR(e32_wait_aux_high(E32_AUX_TIMEOUT_MS, "after mode switch"), TAG, "AUX busy");
-    vTaskDelay(pdMS_TO_TICKS(3));
-
-    return ESP_OK;
-}
-
-static esp_err_t uart_set_baud(uint32_t baudrate)
-{
-    ESP_RETURN_ON_ERROR(uart_wait_tx_done(E32_UART_NUM, pdMS_TO_TICKS(200)), TAG, "uart tx wait failed");
-    ESP_RETURN_ON_ERROR(uart_set_baudrate(E32_UART_NUM, baudrate), TAG, "uart set baud failed");
-    ESP_RETURN_ON_ERROR(uart_flush_input(E32_UART_NUM), TAG, "uart flush input failed");
-    vTaskDelay(pdMS_TO_TICKS(20));
-    return ESP_OK;
-}
-
-static void board_gpio_init(void)
-{
-    gpio_config_t out_conf = {
-        .pin_bit_mask = (1ULL << E32_M0_PIN) | (1ULL << E32_M1_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&out_conf));
-
-    gpio_set_level(E32_M0_PIN, 0);
-    gpio_set_level(E32_M1_PIN, 0);
-
-    gpio_config_t aux_conf = {
-        .pin_bit_mask = (1ULL << E32_AUX_PIN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&aux_conf));
-}
-
-static void uart_init(uint32_t baudrate)
-{
-    const uart_config_t uart_conf = {
-        .baud_rate = (int)baudrate,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-
-    ESP_ERROR_CHECK(uart_driver_install(E32_UART_NUM, E32_UART_RX_BUF, E32_UART_TX_BUF, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(E32_UART_NUM, &uart_conf));
-    ESP_ERROR_CHECK(uart_set_pin(E32_UART_NUM, E32_UART_TX_PIN, E32_UART_RX_PIN,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(gpio_set_pull_mode(E32_UART_RX_PIN, GPIO_PULLUP_ONLY));
-    ESP_ERROR_CHECK(uart_flush_input(E32_UART_NUM));
-}
-
-static esp_err_t e32_find_config_response(const uint8_t *buf, size_t len, uint8_t out_cfg[6])
-{
-    if (len < 6) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    for (size_t i = 0; i + 6 <= len; ++i) {
-        const uint8_t head = buf[i];
-        if ((head == E32_CMD_WRITE_FLASH) || (head == E32_CMD_WRITE_RAM) || (head == E32_CMD_READ_CFG)) {
-            memcpy(out_cfg, &buf[i], 6);
-            return ESP_OK;
-        }
-    }
-
-    return ESP_ERR_NOT_FOUND;
-}
-
-static esp_err_t e32_read_config(uint8_t out_cfg[6])
-{
-    const uint8_t cmd[3] = { E32_CMD_READ_CFG, E32_CMD_READ_CFG, E32_CMD_READ_CFG };
-    uint8_t rx[64];
-    size_t total = 0;
-    const int64_t start = now_ms();
-
-    memset(rx, 0, sizeof(rx));
-    ESP_RETURN_ON_ERROR(e32_wait_aux_high(E32_AUX_TIMEOUT_MS, "read config"), TAG, "AUX busy");
-    ESP_ERROR_CHECK(uart_flush_input(E32_UART_NUM));
-
-    const int written = uart_write_bytes(E32_UART_NUM, cmd, sizeof(cmd));
-    if (written != (int)sizeof(cmd)) {
-        return ESP_FAIL;
-    }
-    ESP_RETURN_ON_ERROR(uart_wait_tx_done(E32_UART_NUM, pdMS_TO_TICKS(200)), TAG, "config command tx failed");
-
-    while ((uint32_t)(now_ms() - start) < E32_CFG_TIMEOUT_MS) {
-        const int rd = uart_read_bytes(E32_UART_NUM, &rx[total], sizeof(rx) - total, pdMS_TO_TICKS(20));
-        if (rd < 0) {
-            return ESP_FAIL;
-        }
-        if (rd > 0) {
-            total += (size_t)rd;
-            if (e32_find_config_response(rx, total, out_cfg) == ESP_OK) {
-                return ESP_OK;
-            }
-            if (total >= sizeof(rx)) {
-                break;
-            }
-        }
-    }
-
-    if (total > 0) {
-        dump_hex("[E32_CFG_RX_UNPARSED]", rx, total);
-    }
-    return ESP_ERR_TIMEOUT;
-}
-
-static esp_err_t e32_write_target_config(void)
-{
-    const uint8_t pkt[6] = {
-        E32_CMD_WRITE_FLASH,
-        E32_CFG_ADDH,
-        E32_CFG_ADDL,
-        E32_CFG_SPEED,
-        E32_CFG_CHAN,
-        E32_CFG_OPTION,
-    };
-
-    ESP_RETURN_ON_ERROR(e32_wait_aux_high(E32_AUX_TIMEOUT_MS, "write config"), TAG, "AUX busy");
-    ESP_ERROR_CHECK(uart_flush_input(E32_UART_NUM));
-
-    dump_hex("[E32_CFG_WRITE]", pkt, sizeof(pkt));
-    const int written = uart_write_bytes(E32_UART_NUM, pkt, sizeof(pkt));
-    if (written != (int)sizeof(pkt)) {
-        return ESP_FAIL;
-    }
-
-    ESP_RETURN_ON_ERROR(uart_wait_tx_done(E32_UART_NUM, pdMS_TO_TICKS(200)), TAG, "config write tx failed");
-    ESP_RETURN_ON_ERROR(e32_wait_aux_high(E32_AUX_TIMEOUT_MS, "after config write"), TAG, "AUX busy after config write");
-    vTaskDelay(pdMS_TO_TICKS(80));
-    return ESP_OK;
-}
-
-static esp_err_t e32_dynamic_configure(void)
-{
-    uint8_t cfg[6] = {0};
-
-    ESP_LOGI(TAG, "dynamic E32 config start: target C0 %02X %02X %02X %02X %02X",
-             E32_CFG_ADDH, E32_CFG_ADDL, E32_CFG_SPEED, E32_CFG_CHAN, E32_CFG_OPTION);
-
-    for (int attempt = 1; attempt <= 3; ++attempt) {
-        ESP_LOGI(TAG, "config attempt %d", attempt);
-
-        ESP_RETURN_ON_ERROR(e32_set_mode(E32_MODE_SLEEP), TAG, "cannot enter sleep/config mode");
-        ESP_RETURN_ON_ERROR(uart_set_baud(E32_CFG_BAUDRATE), TAG, "cannot set config baud");
-
-        esp_err_t read_err = e32_read_config(cfg);
-        if (read_err == ESP_OK) {
-            dump_hex("[E32_CFG_READ]", cfg, sizeof(cfg));
-            if (cfg_matches_target(cfg)) {
-                ESP_LOGI(TAG, "E32 already has target config");
-                return ESP_OK;
-            }
-            ESP_LOGW(TAG, "E32 config differs; rewriting");
-        } else {
-            ESP_LOGW(TAG, "read config failed: %s; rewriting anyway", esp_err_to_name(read_err));
-        }
-
-        ESP_RETURN_ON_ERROR(e32_write_target_config(), TAG, "write target config failed");
-
-        memset(cfg, 0, sizeof(cfg));
-        read_err = e32_read_config(cfg);
-        if (read_err == ESP_OK) {
-            dump_hex("[E32_CFG_VERIFY]", cfg, sizeof(cfg));
-            if (cfg_matches_target(cfg)) {
-                ESP_LOGI(TAG, "E32 config verified OK");
-                return ESP_OK;
-            }
-            ESP_LOGW(TAG, "verify mismatch after write");
-        } else {
-            ESP_LOGW(TAG, "verify read failed after write: %s", esp_err_to_name(read_err));
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(300));
-    }
-
-    return ESP_FAIL;
-}
-
-/* ----------------------------- ASCON tag4 parser ----------------------------- */
-
-static void build_nonce_from_counter(uint32_t counter, uint8_t nonce[16])
-{
-    memset(nonce, 0, 16);
-
-    /* Must match STM32 Edge_Crypto_Pack(). */
-    nonce[0] = (uint8_t)(counter >> 24);
-    nonce[1] = (uint8_t)(counter >> 16);
-    nonce[2] = (uint8_t)(counter >> 8);
-    nonce[3] = (uint8_t)(counter);
-
-    nonce[4] = 0x57U;
-    nonce[5] = 0x53U;
-    nonce[6] = 0x4EU;
-    nonce[7] = 0x31U;
-}
-static int16_t read_i16_le(const uint8_t *p)
-{
-    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
-static uint16_t read_u16_le(const uint8_t *p)
-{
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
-static void sensor_health_to_text(uint8_t flags, char *out, size_t out_len)
-{
-    if ((out == NULL) || (out_len == 0)) {
-        return;
-    }
-
-    out[0] = '\0';
-
-    if (flags == 0U) {
-        snprintf(out, out_len, "OK");
-        return;
-    }
-
-    if ((flags & ERR_SHT30) != 0U) {
-        strncat(out, "SHT30_ERR ", out_len - strlen(out) - 1);
-    }
-
-    if ((flags & ERR_BMP388) != 0U) {
-        strncat(out, "BMP388_ERR ", out_len - strlen(out) - 1);
-    }
-
-    if ((flags & ERR_VBAT) != 0U) {
-        strncat(out, "VBAT_ERR ", out_len - strlen(out) - 1);
-    }
-}
-
-static bool sensor_payload_decode(const uint8_t plaintext[SENSOR_PLAINTEXT_LEN],
-                                  uint32_t frame_counter,
-                                  SensorDecodedData_t *out)
-{
-    if ((plaintext == NULL) || (out == NULL)) {
-        return false;
-    }
-
-    memset(out, 0, sizeof(*out));
-
-    out->frame_counter = frame_counter;
-
+#if TLS_ONLY_BUNDLE_MODE
     /*
-     * STM32 sends packed SensorData_t as 9 bytes:
-     * byte 0..1 : int16_t  env_temp_raw
-     * byte 2..3 : uint16_t env_hum_raw
-     * byte 4..5 : uint16_t air_press_raw
-     * byte 6    : int8_t   board_temp_raw
-     * byte 7    : uint8_t  batt_volt_raw
-     * byte 8    : uint8_t  health_flag
+     * Chế độ chỉ dùng bundle.
+     * Yêu cầu sdkconfig.defaults có:
+     *   CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
      */
-    out->raw.env_temp_raw   = read_i16_le(&plaintext[0]);
-    out->raw.env_hum_raw    = read_u16_le(&plaintext[2]);
-    out->raw.air_press_raw  = read_u16_le(&plaintext[4]);
-    out->raw.board_temp_raw = (int8_t)plaintext[6];
-    out->raw.batt_volt_raw  = plaintext[7];
-    out->raw.health_flag    = plaintext[8];
+    cfg->crt_bundle_attach = esp_crt_bundle_attach;
+    ESP_LOGD(TAG, "[TLS] Chế độ: crt_bundle only (CROSS_SIGNED_VERIFY cần bật trong sdkconfig)");
+#else
+    /*
+     * Chế độ nhúng cert (khuyến nghị).
+     * ca_cert_pem trỏ thẳng vào root CA của Supabase → xác thực
+     * luôn đúng, không phụ thuộc bundle hay cross-signing.
+     * crt_bundle_attach là fallback bổ sung.
+     */
+    cfg->cert_pem       = supabase_root_ca_pem_start;
+    cfg->crt_bundle_attach = esp_crt_bundle_attach;
+    ESP_LOGD(TAG, "[TLS] Chế độ: embedded cert + bundle (DualLayer)");
+#endif
+}
 
-    out->sht30_ok =
-        ((out->raw.health_flag & ERR_SHT30) == 0U) &&
-        (out->raw.env_temp_raw != (int16_t)0xFFFF) &&
-        (out->raw.env_hum_raw != 0xFFFFU);
+/* ═══════════════════════════════════════════════════════════════════
+ * UTILITIES
+ * ═══════════════════════════════════════════════════════════════════ */
+static int64_t now_ms(void) { return esp_timer_get_time() / 1000LL; }
 
-    out->bmp388_ok =
-        ((out->raw.health_flag & ERR_BMP388) == 0U) &&
-        (out->raw.air_press_raw != 0xFFFFU) &&
-        (out->raw.board_temp_raw != (int8_t)0xFF);
+static inline float battery_raw_to_volt(uint8_t raw) {
+    return 3.0f + ((float)raw / 255.0f) * (4.2f - 3.0f);
+}
 
-    out->vbat_ok =
-        ((out->raw.health_flag & ERR_VBAT) == 0U);
+/* ═══════════════════════════════════════════════════════════════════
+ * AI NOWCASTING (SLR) — Core 1
+ * ═══════════════════════════════════════════════════════════════════ */
+static float calculate_slope(float y[], int n) {
+    float sx = 0, sy = 0, sxy = 0, sx2 = 0;
+    for (int i = 0; i < n; i++) { sx += i; sy += y[i]; sxy += i*y[i]; sx2 += i*i; }
+    float d = n*sx2 - sx*sx;
+    return (d == 0.0f) ? 0.0f : (n*sxy - sx*sy) / d;
+}
 
-    out->payload_ok = out->sht30_ok && out->bmp388_ok;
+static float calculate_dew_point(float t, float h) { return t - ((100.0f - h) / 5.0f); }
+
+static void ai_task(void *pvParameters) {
+    ESP_LOGI(TAG, "[AI_ENGINE] Core %d", xPortGetCoreID());
+    AI_DataPoint_t buf[AI_BUFFER_SIZE];
+    float ph[AI_BUFFER_SIZE], hh[AI_BUFFER_SIZE], th[AI_BUFFER_SIZE];
+    int head = 0, count = 0;
+
+    while (1) {
+        AI_DataPoint_t dp;
+        if (xQueueReceive(s_ai_data_queue, &dp, portMAX_DELAY) == pdPASS) {
+            buf[head] = dp;
+            head = (head + 1) % AI_BUFFER_SIZE;
+            if (count < AI_BUFFER_SIZE) count++;
+
+            if (count == AI_BUFFER_SIZE) {
+                int idx = head;
+                for (int i = 0; i < AI_BUFFER_SIZE; i++) {
+                    ph[i] = buf[idx].pressure;
+                    hh[i] = buf[idx].humidity;
+                    th[i] = buf[idx].temperature;
+                    idx = (idx + 1) % AI_BUFFER_SIZE;
+                }
+                g_beta_press = calculate_slope(ph, AI_BUFFER_SIZE);
+                g_beta_hum   = calculate_slope(hh, AI_BUFFER_SIZE);
+                g_beta_temp  = calculate_slope(th, AI_BUFFER_SIZE);
+
+                g_storm_warning  = (g_beta_press < THRESHOLD_BETA_PRESS_STORM &&
+                                    g_beta_hum   > THRESHOLD_BETA_HUM_STORM);
+                g_predicted_temp = dp.temperature + (g_beta_temp * AI_BUFFER_SIZE);
+                g_frost_warning  = (g_beta_temp < THRESHOLD_BETA_TEMP_FROST &&
+                                    g_predicted_temp <= calculate_dew_point(dp.temperature, dp.humidity));
+
+                ESP_LOGI(TAG, "[AI_ENGINE] β_Press=%.4f β_Hum=%.4f β_Temp=%.4f",
+                         g_beta_press, g_beta_hum, g_beta_temp);
+                if (g_storm_warning) ESP_LOGW(TAG, "[AI_ENGINE] ⚠ CẢNH BÁO DÔNG LỐC!");
+                if (g_frost_warning) ESP_LOGW(TAG, "[AI_ENGINE] ❄ CẢNH BÁO SƯƠNG GIÁ! Dự báo: %.2f°C", g_predicted_temp);
+            }
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * SUPABASE POST
+ * ═══════════════════════════════════════════════════════════════════ */
+static void supabase_post_sensor(const SensorDecodedData_t *d) {
+    if (!s_wifi_connected) return;
+
+    const char *trend = (d->air_pressure_hpa < 1000.0f) ? "falling"
+                      : (d->air_pressure_hpa > 1020.0f) ? "rising"
+                      : "stable";
+
+    char body[768];
+    int body_len = snprintf(body, sizeof(body),
+        "{"
+        "\"frame_counter\":%"PRIu32","      // <--- ĐẨY FRAME COUNTER
+        "\"temperature\":%.2f,"
+        "\"humidity\":%.2f,"
+        "\"pressure\":%.2f,"
+        "\"board_temp\":%f,"                // <--- ĐẨY BOARD TEMP
+        "\"battery\":%.3f,"
+        "\"pressure_trend\":\"%s\","
+        "\"storm_warning\":%s,"
+        "\"frost_warning\":%s,"
+        "\"beta_pressure\":%.4f,"
+        "\"beta_humidity\":%.4f,"
+        "\"beta_temperature\":%.4f,"
+        "\"predicted_temp\":%.2f,"
+        "\"device_id\":\"%s\""
+        "}",
+        d->frame_counter,                   // Truyền biến vào
+        d->sht30_ok  ? d->env_temp_c       : 0.0f,
+        d->sht30_ok  ? d->env_humidity_pct : 0.0f,
+        d->bmp388_ok ? d->air_pressure_hpa : 0.0f,
+        d->board_temp_c,                    // Truyền biến vào
+        d->battery_volt, trend,
+        g_storm_warning ? "true" : "false",
+        g_frost_warning ? "true" : "false",
+        g_beta_press, g_beta_hum, g_beta_temp,
+        g_predicted_temp, DEVICE_ID
+    );
+
+    ESP_LOGI(TAG, "[SUPABASE] POST: %s", body);
+
+    char url[160];
+    snprintf(url, sizeof(url), "%s/rest/v1/%s", SUPABASE_URL, SUPABASE_TABLE);
+
+    esp_http_client_config_t http_cfg = {
+        .url               = url,
+        .method            = HTTP_METHOD_POST,
+        .timeout_ms        = HTTP_POST_TIMEOUT_MS,
+        .buffer_size       = 4096,
+        .buffer_size_tx    = 2048,
+        .keep_alive_enable = true,
+    };
+    tls_cfg_fill(&http_cfg);  /* ← gắn TLS DualLayer */
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) { ESP_LOGE(TAG, "[SUPABASE] init failed"); return; }
+
+    esp_http_client_set_header(client, "Content-Type",  "application/json");
+    esp_http_client_set_header(client, "apikey",        SUPABASE_ANON_KEY);
+    esp_http_client_set_header(client, "Authorization", "Bearer " SUPABASE_ANON_KEY);
+    esp_http_client_set_header(client, "Prefer",        "return=minimal");
+    esp_http_client_set_post_field(client, body, body_len);
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int st = esp_http_client_get_status_code(client);
+        if (st == 201 || st == 200)
+            ESP_LOGI(TAG, "[SUPABASE] ✅ HTTP %d", st);
+        else
+            ESP_LOGW(TAG, "[SUPABASE] ⚠ HTTP %d — kiểm tra RLS/table", st);
+    } else {
+        ESP_LOGE(TAG, "[SUPABASE] ❌ %s", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * OTA ENGINE — Core 1
+ * ═══════════════════════════════════════════════════════════════════ */
+static esp_err_t fetch_supabase_ota_url(char *out_url, size_t max_len) {
+    char url[256];
+    snprintf(url, sizeof(url),
+             "%s/rest/v1/device_configs?device_id=eq.%s&select=ota_url",
+             SUPABASE_URL, DEVICE_ID);
+
+    esp_http_client_config_t http_cfg = {
+        .url            = url,
+        .method         = HTTP_METHOD_GET,
+        .timeout_ms     = HTTP_GET_TIMEOUT_MS,
+        .buffer_size    = 4096,
+    };
+    tls_cfg_fill(&http_cfg);
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) return ESP_FAIL;
+
+    esp_http_client_set_header(client, "apikey",        SUPABASE_ANON_KEY);
+    esp_http_client_set_header(client, "Authorization", "Bearer " SUPABASE_ANON_KEY);
+
+    if (esp_http_client_open(client, 0) != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length <= 0) content_length = 2048;
+
+    char *buf = malloc(content_length + 1);
+    if (!buf) { esp_http_client_cleanup(client); return ESP_ERR_NO_MEM; }
+
+    int read_len = esp_http_client_read(client, buf, content_length);
+    esp_http_client_cleanup(client);
+
+    if (read_len <= 0) { free(buf); return ESP_FAIL; }
+    buf[read_len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return ESP_FAIL;
+
+    esp_err_t result = ESP_FAIL;
+    if (cJSON_IsArray(root) && cJSON_GetArraySize(root) > 0) {
+        cJSON *item    = cJSON_GetArrayItem(root, 0);
+        cJSON *url_obj = cJSON_GetObjectItemCaseSensitive(item, "ota_url");
+        if (cJSON_IsString(url_obj) && url_obj->valuestring) {
+            strncpy(out_url, url_obj->valuestring, max_len - 1);
+            out_url[max_len - 1] = '\0';
+            result = ESP_OK;
+        }
+    }
+    cJSON_Delete(root);
+    return result;
+}
+
+static void ota_task(void *pvParameters) {
+    ESP_LOGI(TAG, "[OTA_ENGINE] Core %d — chờ 45 s", xPortGetCoreID());
+    vTaskDelay(pdMS_TO_TICKS(45000));
+
+    char dynamic_ota_url[512]  = {0};
+    char last_flashed_url[512] = {0};
+
+    while (1) {
+        if (s_wifi_connected) {
+            ESP_LOGI(TAG, "[OTA_ENGINE] Quét device_configs...");
+
+            if (fetch_supabase_ota_url(dynamic_ota_url, sizeof(dynamic_ota_url)) == ESP_OK) {
+                bool is_old = false;
+                nvs_handle_t nvs_h;
+                if (nvs_open("ota_store", NVS_READWRITE, &nvs_h) == ESP_OK) {
+                    size_t sz = sizeof(last_flashed_url);
+                    if (nvs_get_str(nvs_h, "last_url", last_flashed_url, &sz) == ESP_OK)
+                        is_old = (strcmp(dynamic_ota_url, last_flashed_url) == 0);
+                    nvs_close(nvs_h);
+                }
+
+                if (is_old) {
+                    ESP_LOGI(TAG, "[OTA_ENGINE] ⏭ Firmware đã cập nhật, bỏ qua.");
+                } else {
+                    ESP_LOGW(TAG, "[OTA_ENGINE] 🚀 Firmware mới: %s", dynamic_ota_url);
+
+                    esp_http_client_config_t ota_http_cfg = {
+                        .url               = dynamic_ota_url,
+                        .timeout_ms        = HTTP_OTA_TIMEOUT_MS,
+                        .buffer_size       = 4096,
+                        .keep_alive_enable = true,
+                    };
+                    tls_cfg_fill(&ota_http_cfg);
+
+                    const esp_https_ota_config_t ota_cfg = { .http_config = &ota_http_cfg };
+
+                    if (esp_https_ota(&ota_cfg) == ESP_OK) {
+                        ESP_LOGI(TAG, "[OTA_ENGINE] ✅ Flash thành công. Khởi động lại...");
+                        if (nvs_open("ota_store", NVS_READWRITE, &nvs_h) == ESP_OK) {
+                            nvs_set_str(nvs_h, "last_url", dynamic_ota_url);
+                            nvs_commit(nvs_h);
+                            nvs_close(nvs_h);
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(3000));
+                        esp_restart();
+                    } else {
+                        ESP_LOGE(TAG, "[OTA_ENGINE] ❌ Flash thất bại.");
+                    }
+                }
+            } else {
+                ESP_LOGD(TAG, "[OTA_ENGINE] Không có OTA URL.");
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(30UL * 60UL * 1000UL));
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * WiFi STA — multi-AP fallback
+ * ═══════════════════════════════════════════════════════════════════ */
+static void wifi_retry_timer_cb(TimerHandle_t xTimer) { esp_wifi_connect(); }
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_wifi_connected = false;
+        s_wifi_idx = (s_wifi_idx + 1) % NUM_WIFIS;
+        ESP_LOGW(TAG, "[WIFI] Thử mạng: %s", s_wifi_list[s_wifi_idx].ssid);
+        wifi_config_t wcfg = {0};
+        strncpy((char *)wcfg.sta.ssid,     s_wifi_list[s_wifi_idx].ssid, sizeof(wcfg.sta.ssid)     - 1);
+        strncpy((char *)wcfg.sta.password, s_wifi_list[s_wifi_idx].pass, sizeof(wcfg.sta.password) - 1);
+        esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+        xTimerStart(s_wifi_timer, 0);
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        s_wifi_connected = true;
+        xTimerStop(s_wifi_timer, 0);
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGI(TAG, "[WIFI] ✅ IP cấp phát OK.");
+    }
+}
+
+static void wifi_init_sta(void) {
+    s_wifi_event_group = xEventGroupCreate();
+    s_wifi_timer = xTimerCreate("wifi_retry", pdMS_TO_TICKS(5000), pdFALSE, NULL, wifi_retry_timer_cb);
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,    &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+    wifi_config_t wcfg = {0};
+    strncpy((char *)wcfg.sta.ssid,     s_wifi_list[0].ssid, sizeof(wcfg.sta.ssid)     - 1);
+    strncpy((char *)wcfg.sta.password, s_wifi_list[0].pass, sizeof(wcfg.sta.password) - 1);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    esp_wifi_start();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * ASCON / SENSOR DECODE
+ * ═══════════════════════════════════════════════════════════════════ */
+static int16_t  read_i16_le(const uint8_t *p) { return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
+static uint16_t read_u16_le(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+
+static void build_nonce_from_counter(uint32_t c, uint8_t n[16]) {
+    memset(n, 0, 16);
+    n[0] = (uint8_t)(c >> 24); n[1] = (uint8_t)(c >> 16);
+    n[2] = (uint8_t)(c >>  8); n[3] = (uint8_t)(c);
+    n[4] = 0x57U; n[5] = 0x53U; n[6] = 0x4EU; n[7] = 0x31U;
+}
+
+static bool sensor_payload_decode(const uint8_t pt[SENSOR_PLAINTEXT_LEN],
+                                  uint32_t counter, SensorDecodedData_t *out) {
+    memset(out, 0, sizeof(*out));
+    SensorPayloadRaw_t raw;
+    raw.env_temp_raw  = read_i16_le(&pt[0]);
+    raw.env_hum_raw   = read_u16_le(&pt[2]);
+    raw.air_press_raw = read_u16_le(&pt[4]);
+    raw.board_temp_raw = pt[6];               // <--- ĐỌC NHIỆT ĐỘ BOARD
+    raw.batt_volt_raw  = pt[7];
+    raw.health_flag   = pt[8];
+
+    out->frame_counter = counter;             // Đã có sẵn frame_counter
+    out->sht30_ok      = ((raw.health_flag & ERR_SHT30)  == 0);
+    out->bmp388_ok     = ((raw.health_flag & ERR_BMP388) == 0);
+    out->payload_ok    = out->sht30_ok && out->bmp388_ok;
 
     if (out->sht30_ok) {
-        out->env_temp_c = ((float)out->raw.env_temp_raw) / 100.0f;
-        out->env_humidity_pct = ((float)out->raw.env_hum_raw) / 100.0f;
+        out->env_temp_c       = (float)raw.env_temp_raw  / 100.0f;
+        out->env_humidity_pct = (float)raw.env_hum_raw   / 100.0f;
     }
-
     if (out->bmp388_ok) {
-        out->air_pressure_hpa = 900.0f + (((float)out->raw.air_press_raw) / 100.0f);
-        out->board_temp_c = (int)out->raw.board_temp_raw;
+        out->air_pressure_hpa = 900.0f + (float)raw.air_press_raw / 100.0f;
     }
-
-    out->battery_raw = out->raw.batt_volt_raw;
-
-    sensor_health_to_text(out->raw.health_flag,
-                          out->health_text,
-                          sizeof(out->health_text));
+    
+    out->board_temp_c = raw.board_temp_raw;   // Gán giá trị Board Temp ra struct
+    out->battery_volt = battery_raw_to_volt(pt[7]);
 
     return true;
 }
 
-static void sensor_payload_print(const SensorDecodedData_t *data)
-{
-    if (data == NULL) {
-        return;
-    }
+/* ═══════════════════════════════════════════════════════════════════
+ * FRAME PROCESSING
+ * ═══════════════════════════════════════════════════════════════════ */
+static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
+    uint32_t counter =  (uint32_t)frame[0]
+                     | ((uint32_t)frame[1] <<  8)
+                     | ((uint32_t)frame[2] << 16)
+                     | ((uint32_t)frame[3] << 24);
 
-    ESP_LOGI(TAG, "========== DECODED SENSOR DATA ==========");
-    ESP_LOGI(TAG, "Frame counter : %" PRIu32, data->frame_counter);
+    ESP_LOGI(TAG, "[LORA_RX] Counter=%"PRIu32" — ASCON-128a...", counter);
 
-    if (data->sht30_ok) {
-        ESP_LOGI(TAG, "Env temp      : %.2f degC", data->env_temp_c);
-        ESP_LOGI(TAG, "Env humidity  : %.2f %%", data->env_humidity_pct);
-    } else {
-        ESP_LOGW(TAG, "Env temp      : N/A");
-        ESP_LOGW(TAG, "Env humidity  : N/A");
-    }
-
-    if (data->bmp388_ok) {
-        ESP_LOGI(TAG, "Air pressure  : %.2f hPa", data->air_pressure_hpa);
-        ESP_LOGI(TAG, "Board temp    : %d degC", data->board_temp_c);
-    } else {
-        ESP_LOGW(TAG, "Air pressure  : N/A");
-        ESP_LOGW(TAG, "Board temp    : N/A");
-    }
-
-    ESP_LOGI(TAG, "Battery raw   : %u%s",
-             data->battery_raw,
-             data->vbat_ok ? "" : " (VBAT error)");
-
-    ESP_LOGI(TAG, "Health flag   : 0x%02X (%s)",
-             data->raw.health_flag,
-             data->health_text);
-
-    ESP_LOGI(TAG,
-             "RAW fields    : T=%d H=%u P=%u BT=%d VB=%u HF=0x%02X",
-             data->raw.env_temp_raw,
-             data->raw.env_hum_raw,
-             data->raw.air_press_raw,
-             data->raw.board_temp_raw,
-             data->raw.batt_volt_raw,
-             data->raw.health_flag);
-
-    ESP_LOGI(TAG, "=========================================");
-}
-static void process_frame(const uint8_t frame[E32_FRAME_LEN])
-{
-    static bool have_last_counter = false;
-    static uint32_t last_counter = 0;
-
-    uint32_t counter;
     uint8_t nonce[16];
-    uint8_t ascon_input[ASCON_INPUT_LEN];
-    uint8_t plaintext[SENSOR_PLAINTEXT_LEN];
-    unsigned long long mlen = 0ULL;
-    int dec_ret;
-
-    /* STM32 sends uint32_t frame_counter in little-endian memory order. */
-    counter =
-        ((uint32_t)frame[0]) |
-        ((uint32_t)frame[1] << 8) |
-        ((uint32_t)frame[2] << 16) |
-        ((uint32_t)frame[3] << 24);
-
-    ESP_LOGI(TAG, "RX frame_counter=%" PRIu32, counter);
-
-    dump_hex("[FRAME_17B]", frame, E32_FRAME_LEN);
-    dump_hex("[CIPHERTEXT_9B]", &frame[4], 9);
-    dump_hex("[ASCON_TAG_4B]", &frame[13], 4);
-
-    if (have_last_counter) {
-        const uint32_t expected = last_counter + 1U;
-        if (counter != expected) {
-            ESP_LOGW(TAG,
-                     "counter jump: last=%" PRIu32 ", now=%" PRIu32 ", expected=%" PRIu32,
-                     last_counter, counter, expected);
-        }
-    }
-
-    last_counter = counter;
-    have_last_counter = true;
-
-    /* crypto_aead_decrypt_tag4() expects ciphertext[9] || tag4[4]. */
-    memcpy(&ascon_input[0], &frame[4], 9);
-    memcpy(&ascon_input[9], &frame[13], 4);
-
     build_nonce_from_counter(counter, nonce);
 
-    memset(plaintext, 0, sizeof(plaintext));
+    uint8_t ascon_input[ASCON_INPUT_LEN];
+    memcpy(&ascon_input[0], &frame[4],  9);
+    memcpy(&ascon_input[9], &frame[13], 4);
 
-    dec_ret = crypto_aead_decrypt_tag4(
-        plaintext,
-        &mlen,
-        NULL,
-        ascon_input,
-        sizeof(ascon_input),
-        NULL,
-        0,
-        nonce,
-        ASCON_SECRET_KEY
-    );
+    uint8_t plaintext[SENSOR_PLAINTEXT_LEN] = {0};
+    unsigned long long mlen = 0ULL;
 
-    if ((dec_ret != 0) || (mlen != SENSOR_PLAINTEXT_LEN)) {
-        ESP_LOGE(TAG, "ASCON tag4 decrypt/verify FAILED ret=%d mlen=%llu",
-                 dec_ret, mlen);
-        return;
+    if (crypto_aead_decrypt_tag4(plaintext, &mlen, NULL,
+                                 ascon_input, sizeof(ascon_input),
+                                 NULL, 0, nonce, ASCON_SECRET_KEY) != 0) {
+        ESP_LOGE(TAG, "[LORA_RX] ❌ ASCON tag lỗi!"); return;
     }
 
-    ESP_LOGI(TAG, "ASCON tag4 decrypt OK");
-    dump_hex("[PLAINTEXT_9B]", plaintext, sizeof(plaintext));
-	SensorDecodedData_t decoded;
+    SensorDecodedData_t decoded;
+    if (!sensor_payload_decode(plaintext, counter, &decoded)) return;
 
-	if (sensor_payload_decode(plaintext, counter, &decoded)) {
-	    sensor_payload_print(&decoded);
-	} else {
-	    ESP_LOGE(TAG, "Sensor payload decode FAILED");
-	}
+    if (decoded.payload_ok) {
+        ESP_LOGI(TAG, "[LORA_RX] ✅ T=%.2f°C H=%.2f%% P=%.2fhPa BAT=%.3fV",
+                 decoded.env_temp_c, decoded.env_humidity_pct,
+                 decoded.air_pressure_hpa, decoded.battery_volt);
+
+        AI_DataPoint_t dp = {
+            .pressure = decoded.air_pressure_hpa,
+            .humidity = decoded.env_humidity_pct,
+            .temperature = decoded.env_temp_c
+        };
+        xQueueSend(s_ai_data_queue, &dp, 0);
+    } else {
+        ESP_LOGW(TAG, "[LORA_RX] Cảm biến biên báo lỗi phần cứng.");
+    }
+    supabase_post_sensor(&decoded);
+    ESP_LOGI(TAG, "[LORA_RX] ✅ C:%"PRIu32" | T=%.2f°C H=%.2f%% P=%.2fhPa BdT=%d°C BAT=%.3fV",
+                 decoded.frame_counter, decoded.env_temp_c, decoded.env_humidity_pct,
+                 decoded.air_pressure_hpa, decoded.board_temp_c, decoded.battery_volt);
 }
 
-/* ----------------------------- LoRa receiver ----------------------------- */
-
-static void receiver_loop(void)
-{
-    uint8_t rx[64];
-    uint8_t frame[E32_FRAME_LEN];
-    size_t frame_pos = 0;
-    int64_t last_byte_time = 0;
-
-    ESP_LOGI(TAG, "receiver loop started; waiting for %d-byte STM32 frames", E32_FRAME_LEN);
-
+/* ═══════════════════════════════════════════════════════════════════
+ * RECEIVER LOOP
+ * ═══════════════════════════════════════════════════════════════════ */
+static void receiver_loop(void) {
+    uint8_t rx[64], frame[E32_FRAME_LEN];
+    size_t  frame_pos = 0; int64_t last_byte_time = 0;
+    ESP_LOGI(TAG, "[LORA_RX] Sẵn sàng, khung %d byte", E32_FRAME_LEN);
     while (1) {
-        const int rd = uart_read_bytes(E32_UART_NUM, rx, sizeof(rx), pdMS_TO_TICKS(50));
-        const int64_t t_now = now_ms();
-
-        if (rd < 0) {
-            ESP_LOGE(TAG, "uart_read_bytes failed");
-            vTaskDelay(pdMS_TO_TICKS(100));
+        int rd = uart_read_bytes(E32_UART_NUM, rx, sizeof(rx), pdMS_TO_TICKS(50));
+        int64_t t_now = now_ms();
+        if (rd <= 0) {
+            if (frame_pos > 0 && (t_now - last_byte_time) > 1000) frame_pos = 0;
             continue;
         }
-
-        if (rd == 0) {
-            if ((frame_pos > 0) && ((t_now - last_byte_time) > 1000)) {
-                ESP_LOGW(TAG, "discard stale partial frame len=%u", (unsigned)frame_pos);
-                dump_hex("[PARTIAL_DROP]", frame, frame_pos);
-                frame_pos = 0;
-            }
-            continue;
-        }
-
-        ESP_LOGI(TAG, "RAW UART RX len=%d", rd);
-        dump_hex("[RAW_RX]", rx, (size_t)rd);
-
         for (int i = 0; i < rd; ++i) {
-            const int64_t b_now = now_ms();
-
-            if ((frame_pos > 0) && ((b_now - last_byte_time) > E32_FRAME_IDLE_MS)) {
-                ESP_LOGW(TAG, "idle gap, discard partial frame len=%u", (unsigned)frame_pos);
-                dump_hex("[PARTIAL_DROP]", frame, frame_pos);
-                frame_pos = 0;
-            }
-
+            int64_t b = now_ms();
+            if (frame_pos > 0 && (b - last_byte_time) > E32_FRAME_IDLE_MS) frame_pos = 0;
             frame[frame_pos++] = rx[i];
-            last_byte_time = b_now;
-
-            if (frame_pos == E32_FRAME_LEN) {
-                process_frame(frame);
-                frame_pos = 0;
-            }
+            last_byte_time = b;
+            if (frame_pos == E32_FRAME_LEN) { process_frame(frame); frame_pos = 0; }
         }
+        ESP_LOGI(TAG,"Hi lucas");
     }
 }
 
-void app_main(void)
-{
-    ESP_LOGI(TAG, "ESP32 E32 gateway boot");
-    ESP_LOGI(TAG, "UART%d TX=%d RX=%d | M0=%d M1=%d AUX=%d",
-             E32_UART_NUM, E32_UART_TX_PIN, E32_UART_RX_PIN, E32_M0_PIN, E32_M1_PIN, E32_AUX_PIN);
+/* ═══════════════════════════════════════════════════════════════════
+ * E32 LORA INIT
+ * ═══════════════════════════════════════════════════════════════════ */
+static void lora_e32_init_config(void) {
+    ESP_LOGI(TAG, "[LORA_CFG] Ghi cấu hình E32...");
+    gpio_set_level(E32_M0_PIN, 1); gpio_set_level(E32_M1_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uint8_t cfg[6] = { E32_CMD_WRITE_FLASH, E32_CFG_ADDH, E32_CFG_ADDL,
+                       E32_CFG_SPEED, E32_CFG_CHAN, E32_CFG_OPTION };
+    uart_write_bytes(E32_UART_NUM, cfg, sizeof(cfg));
+    uart_wait_tx_done(E32_UART_NUM, pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(E32_M0_PIN, 0); gpio_set_level(E32_M1_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "[LORA_CFG] Module sẵn sàng, kênh 0x%02X.", E32_CFG_CHAN);
+}
 
-    board_gpio_init();
-    uart_init(E32_CFG_BAUDRATE);
+/* ═══════════════════════════════════════════════════════════════════
+ * app_main
+ * ═══════════════════════════════════════════════════════════════════ */
+void app_main(void) {
+    ESP_LOGI(TAG, "================================================");
+    ESP_LOGI(TAG, "  TRẠM QUAN TRẮC KHÍ TƯỢNG GATEWAY V3.3 START  ");
+    ESP_LOGI(TAG, "================================================");
 
-    esp_err_t wifi_err = wifi_init_sta();
-    if (wifi_err != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi not ready: %s; continue LoRa RX", esp_err_to_name(wifi_err));
-    }
+    gpio_set_direction(E32_M0_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_direction(E32_M1_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(E32_M0_PIN, 0); gpio_set_level(E32_M1_PIN, 0);
 
-    esp_err_t cfg_err = e32_dynamic_configure();
-    if (cfg_err != ESP_OK) {
-        ESP_LOGE(TAG, "dynamic E32 config failed: %s", esp_err_to_name(cfg_err));
-        ESP_LOGE(TAG, "continuing in normal RX at 115200; if no frame arrives, check M0/M1 output-capable pins, AUX, TX/RX cross, common GND, and power");
-    }
+    uart_driver_install(E32_UART_NUM, 2048, 512, 0, NULL, 0);
+    uart_config_t uc = {
+        .baud_rate  = 115200, .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_param_config(E32_UART_NUM, &uc);
+    uart_set_pin(E32_UART_NUM, E32_UART_TX_PIN, E32_UART_RX_PIN, -1, -1);
 
-    esp_err_t mode_err = e32_set_mode(E32_MODE_NORMAL);
-    if (mode_err != ESP_OK) {
-        ESP_LOGE(TAG, "cannot confirm normal mode with AUX: %s", esp_err_to_name(mode_err));
-        ESP_LOGW(TAG, "forcing M0=0 M1=0 and continuing RX");
-        gpio_set_level(E32_M0_PIN, 0);
-        gpio_set_level(E32_M1_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
+    lora_e32_init_config();
+    wifi_init_sta();
 
-    ESP_ERROR_CHECK(uart_set_baud(E32_RUN_BAUDRATE));
-    ESP_ERROR_CHECK(uart_flush_input(E32_UART_NUM));
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
 
-    ESP_LOGI(TAG, "E32 normal mode requested, UART%d @ %d, target params: ADDR=0x%02X%02X SPEED=0x%02X CHAN=0x%02X OPTION=0x%02X",
-             E32_UART_NUM, E32_RUN_BAUDRATE, E32_CFG_ADDH, E32_CFG_ADDL,
-             E32_CFG_SPEED, E32_CFG_CHAN, E32_CFG_OPTION);
-
+    s_ai_data_queue = xQueueCreate(10, sizeof(AI_DataPoint_t));
+    xTaskCreatePinnedToCore(ai_task,  "AI_TASK",  8192, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(ota_task, "OTA_TASK", 8192, NULL, 4, NULL, 1);
+   
     receiver_loop();
 }
-
