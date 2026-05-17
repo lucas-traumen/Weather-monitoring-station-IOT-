@@ -1,1 +1,3 @@
 Hardware/node_sensor/node_sensor-backups/
+firmware/esp32/build/
+firmware/esp32/.vscode/
