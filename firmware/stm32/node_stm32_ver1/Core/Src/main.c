@@ -37,9 +37,6 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define TPS_SYNC_PORT               GPIOA
-#define TPS_SYNC_PIN                GPIO_PIN_6
-
 #define SENSOR_POWER_SETTLE_MS      20U
 #define SENSOR_MEASURE_WAIT_MS      150U
 
@@ -81,8 +78,8 @@ static const uint8_t ASCON_SECRET_KEY[16] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
-typedef char check_sensor_payload_size[(sizeof(SensorData_t) == 9U) ? 1 : -1];
-typedef char check_lora_frame_size[(sizeof(LoRaTxFrame_t) == 17U) ? 1 : -1];
+typedef char check_sensor_payload_size[(sizeof(SensorData_t) == 10U) ? 1 : -1];
+typedef char check_lora_frame_size[(sizeof(LoRaTxFrame_t) == 18U) ? 1 : -1];
 
 
 //static uint32_t g_tx_elapsed_sec = 0U;
@@ -144,8 +141,8 @@ static uint8_t Edge_Crypto_Pack(const SensorData_t *raw_data,
                                 uint16_t counter,
                                 LoRaTxFrame_t *tx_frame)
 {
-    uint8_t plaintext[9];
-    uint8_t ascon_output[25];
+    uint8_t plaintext[10];
+    uint8_t ascon_output[32];
     uint8_t nonce[16] = {0};
     unsigned long long clen = 0ULL;
     int ret;
@@ -176,14 +173,14 @@ static uint8_t Edge_Crypto_Pack(const SensorData_t *raw_data,
         ASCON_SECRET_KEY
     );
 
-    if ((ret != 0) || (clen < 13ULL)) {
+    if ((ret != 0) || (clen < 14ULL)) {
         sensor_debug_print("[ASCON] Encrypt FAILED, skip TX\r\n");
         return SENSOR_ERR;
     }
 
     tx_frame->frame_counter = counter;
     memcpy(tx_frame->ciphertext, &ascon_output[0], sizeof(tx_frame->ciphertext));
-    memcpy(tx_frame->mac_tag, &ascon_output[9], sizeof(tx_frame->mac_tag));
+    memcpy(tx_frame->mac_tag, &ascon_output[10], sizeof(tx_frame->mac_tag));
 
     return SENSOR_OK;
 }
@@ -905,23 +902,12 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LED_DEBUG_GPIO_Port, LED_DEBUG_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, LORA_M0_Pin|LORA_M1_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : LED_DEBUG_Pin */
-  GPIO_InitStruct.Pin = LED_DEBUG_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LED_DEBUG_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(GPIOA, LORA_M0_Pin|LORA_M1_Pin|TPS_PS_SYNC_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : LORA_AUX_Pin */
   GPIO_InitStruct.Pin = LORA_AUX_Pin;
@@ -929,8 +915,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(LORA_AUX_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LORA_M0_Pin LORA_M1_Pin */
-  GPIO_InitStruct.Pin = LORA_M0_Pin|LORA_M1_Pin;
+  /*Configure GPIO pins : LORA_M0_Pin LORA_M1_Pin TPS_PS_SYNC_Pin */
+  GPIO_InitStruct.Pin = LORA_M0_Pin|LORA_M1_Pin|TPS_PS_SYNC_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;

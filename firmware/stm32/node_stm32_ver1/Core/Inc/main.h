@@ -57,8 +57,6 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define LED_DEBUG_Pin GPIO_PIN_13
-#define LED_DEBUG_GPIO_Port GPIOC
 #define LORA_AUX_Pin GPIO_PIN_1
 #define LORA_AUX_GPIO_Port GPIOA
 #define LORA_TX_Pin GPIO_PIN_2
@@ -69,6 +67,8 @@ void Error_Handler(void);
 #define LORA_M0_GPIO_Port GPIOA
 #define LORA_M1_Pin GPIO_PIN_5
 #define LORA_M1_GPIO_Port GPIOA
+#define TPS_PS_SYNC_Pin GPIO_PIN_6
+#define TPS_PS_SYNC_GPIO_Port GPIOA
 #define SOURCE_SCL_Pin GPIO_PIN_10
 #define SOURCE_SCL_GPIO_Port GPIOB
 #define SOURCE_SDA_Pin GPIO_PIN_11

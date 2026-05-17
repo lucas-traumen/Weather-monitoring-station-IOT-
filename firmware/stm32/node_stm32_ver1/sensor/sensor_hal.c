@@ -226,6 +226,8 @@ uint8_t sensor_lora_transmit(const uint8_t *payload, uint16_t len)
         sensor_debug_print("[LORA] AUX timeout before TX\r\n");
         return SENSOR_ERR;
     }
+    HAL_GPIO_WritePin(TPS_PS_SYNC_GPIO_Port, TPS_PS_SYNC_Pin, GPIO_PIN_SET);
+    sensor_delay_ms(2);
 
     hal_ret = HAL_UART_Transmit(&huart2, (uint8_t *)payload, len, 500);
     if (hal_ret != HAL_OK) {
@@ -238,7 +240,7 @@ uint8_t sensor_lora_transmit(const uint8_t *payload, uint16_t len)
         sensor_debug_print("[LORA] AUX timeout after TX\r\n");
         return SENSOR_ERR;
     }
-
+    HAL_GPIO_WritePin(TPS_PS_SYNC_GPIO_Port, TPS_PS_SYNC_Pin, GPIO_PIN_RESET);
     sensor_debug_print("[LORA] Sent %u bytes over UART2\r\n", (unsigned)len);
     return SENSOR_OK;
 }

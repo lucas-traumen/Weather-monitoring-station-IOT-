@@ -14,3 +14,21 @@ firmware/esp32/.vscode/
 .cproject
 .project
 .settings/
+~
+
+# STM32CubeIDE
+Debug/
+Release/
+
+# Build artifacts
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+
+# KiCad
+*.lck
+.history/

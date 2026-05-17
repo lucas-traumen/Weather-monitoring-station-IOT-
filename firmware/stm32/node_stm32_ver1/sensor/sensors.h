@@ -17,7 +17,7 @@ typedef struct __attribute__((packed)) {
     int16_t  env_temp;    /* SHT30 temperature * 100 */
     uint16_t env_hum;     /* SHT30 humidity * 100 */
     uint16_t air_press;   /* (hPa - 900.0) * 100 */
-    int8_t   board_temp;  /* BMP388 board temperature in degC */
+    int16_t   board_temp;  /* BMP388 board temperature in degC */
     uint8_t  batt_volt;   /* Reserved for future VBAT measurement, currently 0 */
     uint8_t  health_flag; /* Bitmask error flags */
 } SensorData_t;

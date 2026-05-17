@@ -1,2 +1,0 @@
-../ascon/permutations.c:5:6:P12	36	static,ignoring_inline_asm
-../ascon/permutations.c:14:6:P8	36	static,ignoring_inline_asm

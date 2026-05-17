@@ -67,9 +67,9 @@ extern const char supabase_root_ca_pem_end[]   asm("_binary_supabase_root_ca_pem
 #define E32_M1_PIN            GPIO_NUM_38
 #define E32_AUX_PIN           GPIO_NUM_39
 
-#define E32_FRAME_LEN         17
+#define E32_FRAME_LEN         18
 #define E32_FRAME_IDLE_MS     150
-#define SENSOR_PLAINTEXT_LEN  9
+#define SENSOR_PLAINTEXT_LEN  10
 #define ASCON_TAG4_LEN        4
 #define ASCON_INPUT_LEN       (SENSOR_PLAINTEXT_LEN + ASCON_TAG4_LEN)
 
@@ -140,7 +140,7 @@ typedef struct __attribute__((packed)) {
     int16_t  env_temp_raw;
     uint16_t env_hum_raw;
     uint16_t air_press_raw;
-    int8_t   board_temp_raw;
+    int16_t   board_temp_raw;
     uint8_t  batt_volt_raw;
     uint8_t  health_flag;
 } SensorPayloadRaw_t;
@@ -150,11 +150,13 @@ typedef struct {
     float    env_temp_c;
     float    env_humidity_pct;
     float    air_pressure_hpa;
-    float    board_temp_c;
+    float    board_temp_c;      // <-- ĐỔI THÀNH FLOAT ĐỂ HIỆN SỐ THẬP PHÂN
     float    battery_volt;
+    uint8_t  health_flag;       // <-- BỔ SUNG LƯU MÃ LỖI GỐC
     bool     sht30_ok;
     bool     bmp388_ok;
     bool     payload_ok;
+    bool     ina219_ok;
 } SensorDecodedData_t;
 
 static const char *TAG = "WEATHER_GATEWAY";
@@ -268,7 +270,12 @@ static void supabase_post_sensor(const SensorDecodedData_t *d) {
     const char *trend = (d->air_pressure_hpa < 1000.0f) ? "falling"
                       : (d->air_pressure_hpa > 1020.0f) ? "rising"
                       : "stable";
-
+    char bat_str[16];
+    if (d->ina219_ok) {
+        snprintf(bat_str, sizeof(bat_str), "%.3f", d->battery_volt);
+    } else {
+        strcpy(bat_str, "null"); // <--- ĐÂY LÀ ĐIỂM ĂN TIỀN CỦA BẠN
+    }
     char body[768];
     int body_len = snprintf(body, sizeof(body),
         "{"
@@ -277,6 +284,7 @@ static void supabase_post_sensor(const SensorDecodedData_t *d) {
         "\"humidity\":%.2f,"
         "\"pressure\":%.2f,"
         "\"board_temp\":%f,"                // <--- ĐẨY BOARD TEMP
+        "\"battery\":%s,"
         "\"battery\":%.3f,"
         "\"pressure_trend\":\"%s\","
         "\"storm_warning\":%s,"
@@ -292,6 +300,7 @@ static void supabase_post_sensor(const SensorDecodedData_t *d) {
         d->sht30_ok  ? d->env_humidity_pct : 0.0f,
         d->bmp388_ok ? d->air_pressure_hpa : 0.0f,
         d->board_temp_c,                    // Truyền biến vào
+        bat_str,
         d->battery_volt, trend,
         g_storm_warning ? "true" : "false",
         g_frost_warning ? "true" : "false",
@@ -512,18 +521,22 @@ static bool sensor_payload_decode(const uint8_t pt[SENSOR_PLAINTEXT_LEN],
                                   uint32_t counter, SensorDecodedData_t *out) {
     memset(out, 0, sizeof(*out));
     SensorPayloadRaw_t raw;
-    raw.env_temp_raw  = read_i16_le(&pt[0]);
-    raw.env_hum_raw   = read_u16_le(&pt[2]);
-    raw.air_press_raw = read_u16_le(&pt[4]);
-    raw.board_temp_raw = pt[6];               // <--- ĐỌC NHIỆT ĐỘ BOARD
-    raw.batt_volt_raw  = pt[7];
-    raw.health_flag   = pt[8];
+    raw.env_temp_raw   = read_i16_le(&pt[0]);
+    raw.env_hum_raw    = read_u16_le(&pt[2]);
+    raw.air_press_raw  = read_u16_le(&pt[4]);
+    raw.board_temp_raw = read_i16_le(&pt[6]);               
+    raw.batt_volt_raw  = pt[8];
+    raw.health_flag    = pt[9];
 
-    out->frame_counter = counter;             // Đã có sẵn frame_counter
+    out->frame_counter = counter;             
+    out->health_flag   = raw.health_flag;             // <-- LƯU LẠI HEALTH FLAG
     out->sht30_ok      = ((raw.health_flag & ERR_SHT30)  == 0);
     out->bmp388_ok     = ((raw.health_flag & ERR_BMP388) == 0);
     out->payload_ok    = out->sht30_ok && out->bmp388_ok;
-
+    out->ina219_ok     = ((raw.health_flag & ERR_VBAT)   == 0);
+    out->board_temp_c = ((float)raw.board_temp_raw) / 100.0f;   
+    out->battery_volt = battery_raw_to_volt(pt[8]);
+    
     if (out->sht30_ok) {
         out->env_temp_c       = (float)raw.env_temp_raw  / 100.0f;
         out->env_humidity_pct = (float)raw.env_hum_raw   / 100.0f;
@@ -531,9 +544,9 @@ static bool sensor_payload_decode(const uint8_t pt[SENSOR_PLAINTEXT_LEN],
     if (out->bmp388_ok) {
         out->air_pressure_hpa = 900.0f + (float)raw.air_press_raw / 100.0f;
     }
-    
-    out->board_temp_c = raw.board_temp_raw;   // Gán giá trị Board Temp ra struct
-    out->battery_volt = battery_raw_to_volt(pt[7]);
+    if (out->ina219_ok) {
+        out->battery_volt = battery_raw_to_volt(pt[8]);
+    }
 
     return true;
 }
@@ -553,8 +566,8 @@ static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
     build_nonce_from_counter(counter, nonce);
 
     uint8_t ascon_input[ASCON_INPUT_LEN];
-    memcpy(&ascon_input[0], &frame[4],  9);
-    memcpy(&ascon_input[9], &frame[13], 4);
+    memcpy(&ascon_input[0], &frame[4],  10);
+    memcpy(&ascon_input[10], &frame[14], 4);
 
     uint8_t plaintext[SENSOR_PLAINTEXT_LEN] = {0};
     unsigned long long mlen = 0ULL;
@@ -569,9 +582,9 @@ static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
     if (!sensor_payload_decode(plaintext, counter, &decoded)) return;
 
     if (decoded.payload_ok) {
-        ESP_LOGI(TAG, "[LORA_RX] ✅ T=%.2f°C H=%.2f%% P=%.2fhPa BAT=%.3fV",
+        ESP_LOGI(TAG, "[LORA_RX] ✅ T=%.2f°C H=%.2f%% P=%.2fhPa BdT=%.2f°C BAT=%.3fV",
                  decoded.env_temp_c, decoded.env_humidity_pct,
-                 decoded.air_pressure_hpa, decoded.battery_volt);
+                 decoded.air_pressure_hpa,decoded.board_temp_c, decoded.battery_volt);
 
         AI_DataPoint_t dp = {
             .pressure = decoded.air_pressure_hpa,
@@ -583,7 +596,7 @@ static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
         ESP_LOGW(TAG, "[LORA_RX] Cảm biến biên báo lỗi phần cứng.");
     }
     supabase_post_sensor(&decoded);
-    ESP_LOGI(TAG, "[LORA_RX] ✅ C:%"PRIu32" | T=%.2f°C H=%.2f%% P=%.2fhPa BdT=%d°C BAT=%.3fV",
+    ESP_LOGI(TAG, "[LORA_RX] ✅ C:%"PRIu32" | T=%.2f°C H=%.2f%% P=%.2fhPa BdT=%.2f°C BAT=%.3fV",
                  decoded.frame_counter, decoded.env_temp_c, decoded.env_humidity_pct,
                  decoded.air_pressure_hpa, decoded.board_temp_c, decoded.battery_volt);
 }

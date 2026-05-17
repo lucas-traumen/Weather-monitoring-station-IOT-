@@ -7,12 +7,18 @@
 #include "sensor_hal.h"
 #include "driver_sht30.h"
 #include "driver_bmp388.h"
+#include "ina219/INA219.h"
 #include <string.h>
+
+extern I2C_HandleTypeDef hi2c2;
 
 static sht30_handle_t  s_sht30;
 static bmp388_handle_t s_bmp388;
+static INA219_t        s_ina219;
+
 static uint8_t         s_sht30_ok;
 static uint8_t         s_bmp388_ok;
+static uint8_t         s_ina_ok;
 
 static uint16_t clamp_u16_from_float(float value, float scale)
 {
@@ -86,7 +92,13 @@ uint8_t Sensors_Init_Hardware(void)
         ret |= ERR_BMP388;
         sensor_debug_print("[SENSORS] BMP388 init FAILED\r\n");
     }
-
+    if (INA219_Init(&s_ina219, &hi2c2, INA219_ADDRESS) == 1) {
+            s_ina_ok = 1U;
+            sensor_debug_print("[SENSORS] INA219 init OK\r\n");
+        } else {
+            ret |= ERR_VBAT;
+            sensor_debug_print("[SENSORS] INA219 init FAILED\r\n");
+        }
     return ret;
 }
 
@@ -152,31 +164,47 @@ void Sensors_Collect_And_Pack(SensorData_t *payload)
                 payload->air_press = clamp_u16_from_float(p_hpa - 900.0f, 100.0f);
             }
 
-            if (tc > 127.0f) {
-                payload->board_temp = 127;
-            } else if (tc < -128.0f) {
-                payload->board_temp = -128;
-            } else {
-                payload->board_temp = (int8_t)tc;
-            }
-        } else {
-            payload->health_flag |= ERR_BMP388;
-            payload->air_press = 0xFFFFU;
-            payload->board_temp = (int8_t)0xFF;
-        }
+		if (tc > 127.0f) {
+						payload->board_temp = 12700; // 127.00 * 100
+					} else if (tc < -128.0f) {
+						payload->board_temp = -12800;
+					} else {
+						payload->board_temp = (int16_t)(tc * 100.0f); // <-- Lưu phần thập phân
+					}
+				} else {
+					payload->health_flag |= ERR_BMP388;
+					payload->air_press = 0xFFFFU;
+					payload->board_temp = (int16_t)0x7FFF; // Báo lỗi
+				}
     } else {
         payload->health_flag |= ERR_BMP388;
         payload->air_press = 0xFFFFU;
         payload->board_temp = (int8_t)0xFF;
     }
 
-    payload->batt_volt = 0U;
+    // Đọc và Nén dữ liệu Pin (Battery) từ INA219
+        if (s_ina_ok) {
+            uint16_t vbat_mv = INA219_ReadBusVoltage(&s_ina219); // Đọc điện áp (mV)
 
-    sensor_debug_print("[DATA] T=%d H=%u P=%u BT=%d VB=%u HF=0x%02X\r\n",
-                       payload->env_temp,
-                       payload->env_hum,
-                       payload->air_press,
-                       payload->board_temp,
-                       payload->batt_volt,
-                       payload->health_flag);
-}
+            // Map dải điện áp (3000mV -> 4200mV) vào 1 byte (0 -> 255)
+            if (vbat_mv <= 3000U) {
+                payload->batt_volt = 0U;         // Cạn pin (<= 3.0V)
+            } else if (vbat_mv >= 4200U) {
+                payload->batt_volt = 255U;       // Đầy pin (>= 4.2V)
+            } else {
+                payload->batt_volt = (uint8_t)(((vbat_mv - 3000U) * 255U) / 1200U);
+            }
+        } else {
+            payload->health_flag |= ERR_VBAT;
+            payload->batt_volt = 0U;
+        }
+
+        sensor_debug_print("[DATA] T=%d H=%u P=%u BT=%d VBAT=%u (raw) HF=0x%02X\r\n",
+                           payload->env_temp,
+                           payload->env_hum,
+                           payload->air_press,
+                           payload->board_temp,
+                           payload->batt_volt,
+                           payload->health_flag);
+    }
+
