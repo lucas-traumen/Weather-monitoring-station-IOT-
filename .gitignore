@@ -1,11 +1,16 @@
-Hardware/node_sensor/node_sensor-backups
+Hardware/node_sensor/node_sensor-backups/
+
 # ESP-IDF Build directory
 build/
 */build/
 */*/build/
 log/
 
+# Bỏ qua thư mục tự sinh của firmware ESP32
+firmware/esp32/build/
+firmware/esp32/.vscode/
+
 # Eclipse / IDE configuration files
 .cproject
 .project
-.settings//
+.settings/
