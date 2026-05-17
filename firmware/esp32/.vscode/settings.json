@@ -1,5 +1,11 @@
 {
-    "idf.flashType": "UART",
-    "idf.port": "/dev/ttyACM0",
-    "idf.currentSetup": "/home/lucas/.espressif/v6.0.1/esp-idf"
+  "idf.flashType": "UART",
+  "idf.port": "/dev/ttyACM0",
+  "idf.currentSetup": "/home/lucas/.espressif/v6.0.1/esp-idf",
+  "clangd.path": "/home/lucas/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/esp32/build"
+  ]
 }
