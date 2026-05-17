@@ -1,6 +1,6 @@
 ################################################################################
 # Automatically-generated file. Do not edit!
-# Toolchain: GNU Tools for STM32 (13.3.rel1)
+# Toolchain: GNU Tools for STM32 (14.3.rel1)
 ################################################################################
 
 # Add inputs and outputs from these tool invocations to the build variables 
@@ -61,7 +61,7 @@ C_DEPS += \
 
 # Each subdirectory must supply rules for building sources it contributes
 Drivers/STM32F1xx_HAL_Driver/Src/%.o Drivers/STM32F1xx_HAL_Driver/Src/%.su Drivers/STM32F1xx_HAL_Driver/Src/%.cyclo: ../Drivers/STM32F1xx_HAL_Driver/Src/%.c Drivers/STM32F1xx_HAL_Driver/Src/subdir.mk
-	arm-none-eabi-gcc "$<" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32F103xB -c -I../Core/Inc -I"D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor" -I"D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/bmp388" -I"D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sht30" -I"D:/stm32workspacecubeide/bulepill/Driver/CMSIS/DSP/Include" -I../Drivers/STM32F1xx_HAL_Driver/Inc -I../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy -I../Drivers/CMSIS/Device/ST/STM32F1xx/Include -I../Drivers/CMSIS/Include -I"D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/ascon" -Os -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -fshort-enums -MMD -MP -MF"$(@:%.o=%.d)" -MT"$@" --specs=nano.specs -mfloat-abi=soft -mthumb -o "$@"
+	arm-none-eabi-gcc "$<" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32F103xB -c -I../Core/Inc -I"/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor" -I"/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor/bmp388" -I"/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor/sht30" -I"D:/stm32workspacecubeide/bulepill/Driver/CMSIS/DSP/Include" -I../Drivers/STM32F1xx_HAL_Driver/Inc -I../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy -I../Drivers/CMSIS/Device/ST/STM32F1xx/Include -I../Drivers/CMSIS/Include -I"/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/ascon" -Os -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -fshort-enums -MMD -MP -MF"$(@:%.o=%.d)" -MT"$@" --specs=nano.specs -mfloat-abi=soft -mthumb -o "$@"
 
 clean: clean-Drivers-2f-STM32F1xx_HAL_Driver-2f-Src
 

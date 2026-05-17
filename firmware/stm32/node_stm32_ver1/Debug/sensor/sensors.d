@@ -27,8 +27,8 @@ sensor/sensors.o: ../sensor/sensors.c ../sensor/sensors.h \
  ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rtc_ex.h \
  ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h \
  ../sensor/sensor_hal.h ../Core/Inc/main.h \
- D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sht30/driver_sht30.h \
- D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/bmp388/driver_bmp388.h
+ /home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor/sht30/driver_sht30.h \
+ /home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor/bmp388/driver_bmp388.h
 ../sensor/sensors.h:
 ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal.h:
 ../Core/Inc/stm32f1xx_hal_conf.h:
@@ -59,5 +59,5 @@ sensor/sensors.o: ../sensor/sensors.c ../sensor/sensors.h \
 ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h:
 ../sensor/sensor_hal.h:
 ../Core/Inc/main.h:
-D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sht30/driver_sht30.h:
-D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/bmp388/driver_bmp388.h:
+/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor/sht30/driver_sht30.h:
+/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor/bmp388/driver_bmp388.h:

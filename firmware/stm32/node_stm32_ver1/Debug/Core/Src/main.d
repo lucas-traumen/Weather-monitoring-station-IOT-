@@ -26,10 +26,10 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rtc.h \
  ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rtc_ex.h \
  ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h \
- D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sensor_hal.h \
- D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/ascon/api.h \
- D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/ascon/crypto_aead.h \
- D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sensors.h
+ /home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor/sensor_hal.h \
+ /home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/ascon/api.h \
+ /home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/ascon/crypto_aead.h \
+ /home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor/sensors.h
 ../Core/Inc/main.h:
 ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal.h:
 ../Core/Inc/stm32f1xx_hal_conf.h:
@@ -58,7 +58,7 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rtc.h:
 ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_rtc_ex.h:
 ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h:
-D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sensor_hal.h:
-D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/ascon/api.h:
-D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/ascon/crypto_aead.h:
-D:/Github/Course-Project-1/firmware/stm32/node_stm32_ver1/sensor/sensors.h:
+/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor/sensor_hal.h:
+/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/ascon/api.h:
+/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/ascon/crypto_aead.h:
+/home/lucas/Desktop/Github/Project_1/Weather-monitoring-station-IOT-/firmware/stm32/node_stm32_ver1/sensor/sensors.h:
