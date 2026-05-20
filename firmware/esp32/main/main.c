@@ -37,25 +37,14 @@
 
 /*
  * ════════════════════════════════════════════════════════════════════
- *  ROOT CA CERT NHÚNG TRỰC TIẾP (TLS DualLayer Strategy)
- *
- *  File supabase_root_ca.pem được CMakeLists.txt biên dịch
- *  thành symbol nhị phân và nhúng vào flash firmware.
- *
- *  Cách dùng:
- *    .ca_cert_pem = (const char *)supabase_root_ca_pem_start
- *
- *  Nếu chưa có file .pem, TẠM THỜI comment 2 dòng extern dưới và
- *  dùng ONLY_BUNDLE_MODE (xem #define bên dưới).
+ * ROOT CA CERT NHÚNG TRỰC TIẾP (TLS DualLayer Strategy)
  * ════════════════════════════════════════════════════════════════════
  */
 extern const char supabase_root_ca_pem_start[] asm("_binary_supabase_root_ca_pem_start");
 extern const char supabase_root_ca_pem_end[]   asm("_binary_supabase_root_ca_pem_end");
 
 /*
- * Đặt thành 1 nếu chưa có file supabase_root_ca.pem:
- *   chỉ dùng crt_bundle + cross-signed verify (sdkconfig.defaults)
- * Đặt thành 0 khi đã có file .pem (khuyến nghị, chắc chắn nhất).
+ * Đặt thành 1: Dùng Global Bundle (Phù hợp với Cloudflare/Supabase xoay vòng chứng chỉ)
  */
 #define TLS_ONLY_BUNDLE_MODE  0
 
@@ -86,7 +75,7 @@ typedef struct { const char *ssid; const char *pass; } wifi_cred_t;
 static const wifi_cred_t s_wifi_list[] = {
     {"Truong Lung",   "12345678"},
     {"LUCAS",         "12345678"},
-    {"WIFI_DU_PHONG", "matkhauduphong"}
+    {"Phòng toàn trai đẹp", "aicungdeptrai<3"}
 };
 static const int NUM_WIFIS = sizeof(s_wifi_list) / sizeof(s_wifi_list[0]);
 static int           s_wifi_idx       = 0;
@@ -150,9 +139,9 @@ typedef struct {
     float    env_temp_c;
     float    env_humidity_pct;
     float    air_pressure_hpa;
-    float    board_temp_c;      // <-- ĐỔI THÀNH FLOAT ĐỂ HIỆN SỐ THẬP PHÂN
+    float    board_temp_c;      
     float    battery_volt;
-    uint8_t  health_flag;       // <-- BỔ SUNG LƯU MÃ LỖI GỐC
+    uint8_t  health_flag;       
     bool     sht30_ok;
     bool     bmp388_ok;
     bool     payload_ok;
@@ -169,37 +158,13 @@ static const uint8_t ASCON_SECRET_KEY[16] = {
 
 /* ═══════════════════════════════════════════════════════════════════
  * HELPER: Tạo esp_http_client_config_t đúng chuẩn TLS cho Supabase
- *
- * Chiến lược DualLayer:
- *   [Layer 1] ca_cert_pem  → cert cụ thể của Supabase (chắc chắn nhất)
- *   [Layer 2] crt_bundle_attach → Mozilla bundle làm dự phòng
- *
- * Khi TLS_ONLY_BUNDLE_MODE=1 (chưa có .pem):
- *   Chỉ dùng bundle + CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY
  * ═══════════════════════════════════════════════════════════════════ */
 static void tls_cfg_fill(esp_http_client_config_t *cfg)
 {
-#if TLS_ONLY_BUNDLE_MODE
-    /*
-     * Chế độ chỉ dùng bundle.
-     * Yêu cầu sdkconfig.defaults có:
-     *   CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
-     */
-    cfg->crt_bundle_attach = esp_crt_bundle_attach;
-    ESP_LOGD(TAG, "[TLS] Chế độ: crt_bundle only (CROSS_SIGNED_VERIFY cần bật trong sdkconfig)");
-#else
-    /*
-     * Chế độ nhúng cert (khuyến nghị).
-     * ca_cert_pem trỏ thẳng vào root CA của Supabase → xác thực
-     * luôn đúng, không phụ thuộc bundle hay cross-signing.
-     * crt_bundle_attach là fallback bổ sung.
-     */
-    cfg->cert_pem       = supabase_root_ca_pem_start;
-    cfg->crt_bundle_attach = esp_crt_bundle_attach;
-    ESP_LOGD(TAG, "[TLS] Chế độ: embedded cert + bundle (DualLayer)");
-#endif
+    cfg->cert_pem = supabase_root_ca_pem_start;
+    cfg->crt_bundle_attach = NULL;  // Bắt buộc set NULL để tắt bundle cũ
+    ESP_LOGI(TAG, "[TLS] Chế độ: Sử dụng Custom PEM Root CA");
 }
-
 /* ═══════════════════════════════════════════════════════════════════
  * UTILITIES
  * ═══════════════════════════════════════════════════════════════════ */
@@ -274,18 +239,19 @@ static void supabase_post_sensor(const SensorDecodedData_t *d) {
     if (d->ina219_ok) {
         snprintf(bat_str, sizeof(bat_str), "%.3f", d->battery_volt);
     } else {
-        strcpy(bat_str, "null"); // <--- ĐÂY LÀ ĐIỂM ĂN TIỀN CỦA BẠN
+        strcpy(bat_str, "null"); 
     }
+    
     char body[768];
+    // Đã sửa lỗi JSON duplicate key "battery" tại đây
     int body_len = snprintf(body, sizeof(body),
         "{"
-        "\"frame_counter\":%"PRIu32","      // <--- ĐẨY FRAME COUNTER
+        "\"frame_counter\":%"PRIu32","      
         "\"temperature\":%.2f,"
         "\"humidity\":%.2f,"
         "\"pressure\":%.2f,"
-        "\"board_temp\":%f,"                // <--- ĐẨY BOARD TEMP
+        "\"board_temp\":%.2f,"                
         "\"battery\":%s,"
-        "\"battery\":%.3f,"
         "\"pressure_trend\":\"%s\","
         "\"storm_warning\":%s,"
         "\"frost_warning\":%s,"
@@ -295,13 +261,13 @@ static void supabase_post_sensor(const SensorDecodedData_t *d) {
         "\"predicted_temp\":%.2f,"
         "\"device_id\":\"%s\""
         "}",
-        d->frame_counter,                   // Truyền biến vào
+        d->frame_counter,                   
         d->sht30_ok  ? d->env_temp_c       : 0.0f,
         d->sht30_ok  ? d->env_humidity_pct : 0.0f,
         d->bmp388_ok ? d->air_pressure_hpa : 0.0f,
-        d->board_temp_c,                    // Truyền biến vào
-        bat_str,
-        d->battery_volt, trend,
+        d->board_temp_c,                    
+        bat_str, 
+        trend,
         g_storm_warning ? "true" : "false",
         g_frost_warning ? "true" : "false",
         g_beta_press, g_beta_hum, g_beta_temp,
@@ -529,13 +495,13 @@ static bool sensor_payload_decode(const uint8_t pt[SENSOR_PLAINTEXT_LEN],
     raw.health_flag    = pt[9];
 
     out->frame_counter = counter;             
-    out->health_flag   = raw.health_flag;             // <-- LƯU LẠI HEALTH FLAG
+    out->health_flag   = raw.health_flag;             
     out->sht30_ok      = ((raw.health_flag & ERR_SHT30)  == 0);
     out->bmp388_ok     = ((raw.health_flag & ERR_BMP388) == 0);
     out->payload_ok    = out->sht30_ok && out->bmp388_ok;
     out->ina219_ok     = ((raw.health_flag & ERR_VBAT)   == 0);
-    out->board_temp_c = ((float)raw.board_temp_raw) / 100.0f;   
-    out->battery_volt = battery_raw_to_volt(pt[8]);
+    out->board_temp_c  = ((float)raw.board_temp_raw) / 100.0f;   
+    out->battery_volt  = battery_raw_to_volt(pt[8]);
     
     if (out->sht30_ok) {
         out->env_temp_c       = (float)raw.env_temp_raw  / 100.0f;
@@ -593,12 +559,9 @@ static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
         };
         xQueueSend(s_ai_data_queue, &dp, 0);
     } else {
-        ESP_LOGW(TAG, "[LORA_RX] Cảm biến biên báo lỗi phần cứng.");
+        ESP_LOGW(TAG, "[LORA_RX] Cảm biến báo lỗi phần cứng.");
     }
     supabase_post_sensor(&decoded);
-    ESP_LOGI(TAG, "[LORA_RX] ✅ C:%"PRIu32" | T=%.2f°C H=%.2f%% P=%.2fhPa BdT=%.2f°C BAT=%.3fV",
-                 decoded.frame_counter, decoded.env_temp_c, decoded.env_humidity_pct,
-                 decoded.air_pressure_hpa, decoded.board_temp_c, decoded.battery_volt);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -622,7 +585,6 @@ static void receiver_loop(void) {
             last_byte_time = b;
             if (frame_pos == E32_FRAME_LEN) { process_frame(frame); frame_pos = 0; }
         }
-        ESP_LOGI(TAG,"Hi lucas");
     }
 }
 
@@ -667,10 +629,51 @@ void app_main(void) {
     lora_e32_init_config();
     wifi_init_sta();
 
+    /* ── Chờ WiFi kết nối TRƯỚC khi khởi động NTP ──────────────────────
+     * wifi_init_sta() chỉ gọi esp_wifi_start() rồi return ngay (async).
+     * Nếu khởi động SNTP khi chưa có IP → NTP không sync được → đồng hồ
+     * vẫn là epoch 1970 → TLS xác minh cert THẤT BẠI ("not yet valid").
+     * ─────────────────────────────────────────────────────────────────── */
+    ESP_LOGI(TAG, "[BOOT] Chờ WiFi trước khi đồng bộ NTP...");
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT,
+                                           pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(30000));
+    if (!(bits & WIFI_CONNECTED_BIT)) {
+        ESP_LOGW(TAG, "[BOOT] ⚠ WiFi chưa kết nối sau 30s — NTP/TLS có thể thất bại!");
+    }
+
+    /* Bắt đầu cấu hình và đồng bộ NTP (chỉ sau khi có mạng) */
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.cloudflare.com"); /* backup server */
     esp_sntp_init();
 
+    /* --- ĐOẠN CODE ĐÃ ĐƯỢC CẬP NHẬT MÚI GIỜ --- */
+    int retry = 0;
+    const int retry_count = 20; 
+    time_t now = 0;
+    struct tm timeinfo = { 0 };
+    
+    // Kiểm tra xem năm hiện tại đã lớn hơn 2023 chưa (1970 là chưa sync)
+    while (timeinfo.tm_year < (2023 - 1900) && ++retry < retry_count) {
+        ESP_LOGI(TAG, "[NTP] Đang chờ đồng bộ thời gian từ Internet... (%d/%d)", retry, retry_count);
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Đợi 2 giây
+        time(&now);
+        localtime_r(&now, &timeinfo);
+    }
+
+    if (timeinfo.tm_year < (2023 - 1900)) {
+        ESP_LOGE(TAG, "[NTP] ❌ Không đồng bộ được thời gian! TLS chắc chắn sẽ thất bại.");
+    } else {
+        // Cấu hình múi giờ UTC+7 (Cú pháp POSIX là UTC-7)
+        setenv("TZ", "UTC-7", 1);
+        tzset();
+        
+        ESP_LOGI(TAG, "[NTP] ✅ Đồng hồ đã sync chuẩn: %s", ctime(&now));
+    }
+    /* ------------------------------------------- */
+    
     s_ai_data_queue = xQueueCreate(10, sizeof(AI_DataPoint_t));
     xTaskCreatePinnedToCore(ai_task,  "AI_TASK",  8192, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(ota_task, "OTA_TASK", 8192, NULL, 4, NULL, 1);
