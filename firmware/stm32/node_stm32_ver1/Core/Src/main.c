@@ -116,7 +116,46 @@ static void debug_dump_hex(const char *prefix, const uint8_t *data, uint16_t len
     }
     sensor_debug_print("\r\n");
 }
+/* Hàm phục hồi Bus I2C (Giải cứu cảm biến bị kẹt) */
+void I2C_Recover_Bus(GPIO_TypeDef* SCL_Port, uint16_t SCL_Pin, GPIO_TypeDef* SDA_Port, uint16_t SDA_Pin)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
 
+    // 1. Cấu hình SCL và SDA thành Output Open-Drain tạm thời
+    GPIO_InitStruct.Pin = SCL_Pin | SDA_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(SCL_Port, &GPIO_InitStruct); // Chú ý: Cần Init đúng Port (vd GPIOB)
+
+    HAL_GPIO_WritePin(SCL_Port, SCL_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(SDA_Port, SDA_Pin, GPIO_PIN_SET);
+    HAL_Delay(1);
+
+    // 2. Tạo tối đa 9 xung clock trên SCL để ép Slave nhả SDA
+    for (int i = 0; i < 9; i++) {
+        // Kiểm tra xem chân SDA đã được nhả lên HIGH chưa
+        if (HAL_GPIO_ReadPin(SDA_Port, SDA_Pin) == GPIO_PIN_SET) {
+            break; // Bus đã rảnh, thoát vòng lặp
+        }
+
+        // Kéo SCL xuống LOW rồi lên HIGH (Tạo 1 xung clock)
+        HAL_GPIO_WritePin(SCL_Port, SCL_Pin, GPIO_PIN_RESET);
+        HAL_Delay(1);
+        HAL_GPIO_WritePin(SCL_Port, SCL_Pin, GPIO_PIN_SET);
+        HAL_Delay(1);
+    }
+
+    // 3. Tạo tín hiệu STOP ảo để reset trạng thái của tất cả Slave
+    HAL_GPIO_WritePin(SCL_Port, SCL_Pin, GPIO_PIN_RESET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SDA_Port, SDA_Pin, GPIO_PIN_RESET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SCL_Port, SCL_Pin, GPIO_PIN_SET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SDA_Port, SDA_Pin, GPIO_PIN_SET);
+    HAL_Delay(1);
+}
 static uint8_t lora_cfg_is_target(const uint8_t cfg[6])
 {
     return (cfg[0] == 0xC0 &&
@@ -520,6 +559,12 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  // (Giả sử I2C1 dùng PB6(SCL) và PB7(SDA))
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    I2C_Recover_Bus(GPIOB, GPIO_PIN_6, GPIOB, GPIO_PIN_7);
+
+    //(Nếu có I2C2 dùng PB10/PB11, gọi thêm 1 lần nữa cho I2C2)
+     I2C_Recover_Bus(GPIOB, GPIO_PIN_10, GPIOB, GPIO_PIN_11);
   MX_I2C1_Init();
   MX_I2C2_Init();
   MX_IWDG_Init();
