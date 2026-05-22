@@ -48,6 +48,7 @@
 #include "cJSON.h"
 #include <bootloader_common.h>
 #include "crypto_aead.h"
+#include "mlr_engine.h"
 
 static const char *TAG = "WEATHER_GATEWAY";
 
@@ -219,40 +220,32 @@ static inline float battery_raw_to_volt(uint8_t raw) {
 
 /**
  * @brief Task xử lý AI trên vi điều khiển (Core 1).
- * @details Chạy mô hình Hồi quy tuyến tính đa biến (Multiple Linear Regression - MLR).
- * Tự động chuyển đổi bộ hệ số (Ngày/Đêm) dựa vào giờ thực tế để dự báo nhiệt độ 2 giờ tới.
+ * @details Nhận dữ liệu cảm biến từ Queue, gọi C++ MLR Engine để dự báo nhiệt độ 2 giờ tới.
+ * Toàn bộ logic hệ số và ngữ cảnh Ngày/Đêm được đóng gói trong mlr_engine.cpp.
  * @param pvParameters Tham số truyền vào Task (không dùng).
  */
 static void ai_task(void *pvParameters) {
     ESP_LOGI(TAG, "[AI_ENGINE] Core %d khởi động.", xPortGetCoreID());
+    mlr_engine_init();
 
     while (1) {
         AI_DataPoint_t dp;
         // Task ngủ chờ dữ liệu (giải phóng CPU)
         if (xQueueReceive(s_ai_data_queue, &dp, portMAX_DELAY) == pdPASS) {
-            
-            // 1. Lấy giờ thực tế (đã đồng bộ qua NTP)
+
+            // Lấy giờ thực tế (đã đồng bộ qua NTP) để MLR Engine chọn ngữ cảnh Ngày/Đêm
             time_t now;
             struct tm timeinfo;
             time(&now);
             localtime_r(&now, &timeinfo);
-            int current_hour = timeinfo.tm_hour;
 
-            float C_COEF, M1_HUM, M2_PRESS;
-            
-            // 2. Chuyển đổi ngữ cảnh (Context Switching) cho mô hình
-            if (current_hour >= 6 && current_hour < 18) {
-                // Sử dụng trọng số Ban ngày (Nhiệt độ cơ sở cao, độ ẩm tác động mạnh)
-                C_COEF = 28.5f; M1_HUM = -0.15f; M2_PRESS = 0.08f;
-            } else {
-                // Sử dụng trọng số Ban đêm (Nhiệt độ cơ sở thấp, độ ẩm ít tác động)
-                C_COEF = 22.0f; M1_HUM = -0.05f; M2_PRESS = 0.02f;
-            }
+            // Suy luận (Inference): Gọi C++ MLR Engine dự báo nhiệt độ 2 giờ tới
+            g_mlr_predicted_temp_2h = mlr_engine_predict_2h(
+                dp.temperature, dp.humidity, dp.pressure, timeinfo.tm_hour
+            );
 
-            // 3. Suy luận (Inference): Phương trình MLR dự đoán nhiệt độ 2 giờ
-            g_mlr_predicted_temp_2h = C_COEF + (M1_HUM * dp.humidity) + (M2_PRESS * dp.pressure);
-            
-            ESP_LOGI(TAG, "[MLR_MODEL] Giờ: %d -> Dự báo nhiệt độ 2h tới: %.2f°C", current_hour, g_mlr_predicted_temp_2h);
+            ESP_LOGI(TAG, "[AI_ENGINE] Giờ: %d -> Dự báo nhiệt độ 2h tới: %.2f°C",
+                     timeinfo.tm_hour, g_mlr_predicted_temp_2h);
         }
     }
 }
