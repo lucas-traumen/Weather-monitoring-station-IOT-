@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
 #include <time.h>
@@ -48,6 +49,7 @@
 #include "cJSON.h"
 #include <bootloader_common.h>
 #include "crypto_aead.h"
+#include "mlr_engine.h"
 
 static const char *TAG = "WEATHER_GATEWAY";
 
@@ -59,9 +61,9 @@ static const char *TAG = "WEATHER_GATEWAY";
 #define E32_UART_NUM          UART_NUM_2
 #define E32_UART_TX_PIN       GPIO_NUM_17
 #define E32_UART_RX_PIN       GPIO_NUM_18
-#define E32_M0_PIN            GPIO_NUM_37
-#define E32_M1_PIN            GPIO_NUM_38
-#define E32_AUX_PIN           GPIO_NUM_39
+#define E32_M0_PIN            GPIO_NUM_6
+#define E32_M1_PIN            GPIO_NUM_7
+#define E32_AUX_PIN           GPIO_NUM_8
 
 /** @defgroup LoRa_Frame Cấu hình khung truyền dữ liệu LoRa */
 #define E32_FRAME_LEN         18    /**< Tổng chiều dài khung truyền LoRa (bytes) */
@@ -77,6 +79,20 @@ static const char *TAG = "WEATHER_GATEWAY";
 #define E32_CFG_CHAN          0x17
 #define E32_CFG_OPTION        0x44
 #define E32_CMD_WRITE_FLASH   0xC0
+
+/*
+ * E32 UART baudrate:
+ * - CONFIG_BAUD: baud dùng để nói chuyện với module khi vào Sleep/Config mode.
+ *   E32 mới hoặc reset factory thường là 9600.
+ * - RUN_BAUD: baud sau khi ghi E32_CFG_SPEED = 0x3A.
+ */
+#define E32_CONFIG_BAUD       9600
+#define E32_RUN_BAUD          115200
+#define E32_CFG_PACKET_LEN    6
+#define E32_AUX_TIMEOUT_MS    1500
+
+/* Bật log raw UART để debug lúc chưa nhận được gói LoRa. Khi chạy ổn có thể đổi về 0. */
+#define LORA_DEBUG_RAW_RX     1
 
 /* ==============================================================================
  * 2. CẤU HÌNH MẠNG VÀ ĐÁM MÂY (NETWORK & CLOUD CONFIG)
@@ -219,40 +235,32 @@ static inline float battery_raw_to_volt(uint8_t raw) {
 
 /**
  * @brief Task xử lý AI trên vi điều khiển (Core 1).
- * @details Chạy mô hình Hồi quy tuyến tính đa biến (Multiple Linear Regression - MLR).
- * Tự động chuyển đổi bộ hệ số (Ngày/Đêm) dựa vào giờ thực tế để dự báo nhiệt độ 2 giờ tới.
+ * @details Nhận dữ liệu cảm biến từ Queue, gọi C++ MLR Engine để dự báo nhiệt độ 2 giờ tới.
+ * Toàn bộ logic hệ số và ngữ cảnh Ngày/Đêm được đóng gói trong mlr_engine.cpp.
  * @param pvParameters Tham số truyền vào Task (không dùng).
  */
 static void ai_task(void *pvParameters) {
     ESP_LOGI(TAG, "[AI_ENGINE] Core %d khởi động.", xPortGetCoreID());
+    mlr_engine_init();
 
     while (1) {
         AI_DataPoint_t dp;
         // Task ngủ chờ dữ liệu (giải phóng CPU)
         if (xQueueReceive(s_ai_data_queue, &dp, portMAX_DELAY) == pdPASS) {
-            
-            // 1. Lấy giờ thực tế (đã đồng bộ qua NTP)
+
+            // Lấy giờ thực tế (đã đồng bộ qua NTP) để MLR Engine chọn ngữ cảnh Ngày/Đêm
             time_t now;
             struct tm timeinfo;
             time(&now);
             localtime_r(&now, &timeinfo);
-            int current_hour = timeinfo.tm_hour;
 
-            float C_COEF, M1_HUM, M2_PRESS;
-            
-            // 2. Chuyển đổi ngữ cảnh (Context Switching) cho mô hình
-            if (current_hour >= 6 && current_hour < 18) {
-                // Sử dụng trọng số Ban ngày (Nhiệt độ cơ sở cao, độ ẩm tác động mạnh)
-                C_COEF = 28.5f; M1_HUM = -0.15f; M2_PRESS = 0.08f;
-            } else {
-                // Sử dụng trọng số Ban đêm (Nhiệt độ cơ sở thấp, độ ẩm ít tác động)
-                C_COEF = 22.0f; M1_HUM = -0.05f; M2_PRESS = 0.02f;
-            }
+            // Suy luận (Inference): Gọi C++ MLR Engine dự báo nhiệt độ 2 giờ tới
+            g_mlr_predicted_temp_2h = mlr_engine_predict_2h(
+                dp.temperature, dp.humidity, dp.pressure, timeinfo.tm_hour
+            );
 
-            // 3. Suy luận (Inference): Phương trình MLR dự đoán nhiệt độ 2 giờ
-            g_mlr_predicted_temp_2h = C_COEF + (M1_HUM * dp.humidity) + (M2_PRESS * dp.pressure);
-            
-            ESP_LOGI(TAG, "[MLR_MODEL] Giờ: %d -> Dự báo nhiệt độ 2h tới: %.2f°C", current_hour, g_mlr_predicted_temp_2h);
+            ESP_LOGI(TAG, "[AI_ENGINE] Giờ: %d -> Dự báo nhiệt độ 2h tới: %.2f°C",
+                     timeinfo.tm_hour, g_mlr_predicted_temp_2h);
         }
     }
 }
@@ -268,34 +276,51 @@ static void ai_task(void *pvParameters) {
 static void supabase_post_sensor(const SensorDecodedData_t *d) {
     if (!s_wifi_connected) return;
 
-    // Chuỗi mô tả trạng thái pin
-    char bat_str[16];
+    /*
+     * Dữ liệu lỗi nên gửi null thay vì 0.0 để database không hiểu nhầm là giá trị thật.
+     * Supabase/PostgREST chấp nhận number/null trong JSON.
+     */
+    char temp_str[24], hum_str[24], press_str[24], bat_str[24];
+    if (d->sht30_ok) {
+        snprintf(temp_str, sizeof(temp_str), "%.2f", d->env_temp_c);
+        snprintf(hum_str,  sizeof(hum_str),  "%.2f", d->env_humidity_pct);
+    } else {
+        strcpy(temp_str, "null");
+        strcpy(hum_str,  "null");
+    }
+
+    if (d->bmp388_ok) {
+        snprintf(press_str, sizeof(press_str), "%.2f", d->air_pressure_hpa);
+    } else {
+        strcpy(press_str, "null");
+    }
+
     if (d->ina219_ok) {
         snprintf(bat_str, sizeof(bat_str), "%.3f", d->battery_volt);
     } else {
-        strcpy(bat_str, "null"); 
+        strcpy(bat_str, "null");
     }
-    
+
     // Đóng gói JSON Payload
     char body[512];
     int body_len = snprintf(body, sizeof(body),
         "{"
-        "\"frame_counter\":%"PRIu32","      
-        "\"temperature\":%.2f,"
-        "\"humidity\":%.2f,"
-        "\"pressure\":%.2f,"
-        "\"board_temp\":%.2f,"                
+        "\"frame_counter\":%"PRIu32","
+        "\"temperature\":%s,"
+        "\"humidity\":%s,"
+        "\"pressure\":%s,"
+        "\"board_temp\":%.2f,"
         "\"battery\":%s,"
         "\"predicted_temp_2h\":%.2f,"
         "\"device_id\":\"%s\""
         "}",
-        d->frame_counter,                   
-        d->sht30_ok  ? d->env_temp_c       : 0.0f,
-        d->sht30_ok  ? d->env_humidity_pct : 0.0f,
-        d->bmp388_ok ? d->air_pressure_hpa : 0.0f,
-        d->board_temp_c,                    
-        bat_str, 
-        g_mlr_predicted_temp_2h, 
+        d->frame_counter,
+        temp_str,
+        hum_str,
+        press_str,
+        d->board_temp_c,
+        bat_str,
+        g_mlr_predicted_temp_2h,
         DEVICE_ID
     );
 
@@ -478,6 +503,18 @@ static void ota_task(void *pvParameters) {
  * 9. KẾT NỐI WIFI (WIFI STATION)
  * ============================================================================== */
 
+/**
+ * @brief Khởi tạo NVS một lần ở đầu chương trình.
+ */
+static void app_nvs_init(void) {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+}
+
 static void wifi_retry_timer_cb(TimerHandle_t xTimer) { 
     esp_wifi_connect(); 
 }
@@ -511,8 +548,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 static void wifi_init_sta(void) {
     s_wifi_event_group = xEventGroupCreate();
     s_wifi_timer = xTimerCreate("wifi_retry", pdMS_TO_TICKS(5000), pdFALSE, NULL, wifi_retry_timer_cb);
-    nvs_flash_init();
-    esp_netif_init();
+    ESP_ERROR_CHECK(esp_netif_init());
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_sta();
     
@@ -656,64 +692,165 @@ static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
  * @brief Vòng lặp chính liên tục lắng nghe tín hiệu UART từ module LoRa E32.
  * @details Được gán mức ưu tiên cao nhất (Priority 10) để tránh rớt khung truyền vô tuyến.
  */
+static esp_err_t e32_wait_aux_high(uint32_t timeout_ms) {
+    int64_t start_ms = now_ms();
+
+    while ((now_ms() - start_ms) < timeout_ms) {
+        if (gpio_get_level(E32_AUX_PIN) == 1) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    ESP_LOGW(TAG, "[LORA_CFG] AUX vẫn LOW sau %"PRIu32" ms", timeout_ms);
+    return ESP_ERR_TIMEOUT;
+}
+
+static void e32_set_mode(uint8_t m0, uint8_t m1, const char *mode_name) {
+    gpio_set_level(E32_M0_PIN, m0 ? 1 : 0);
+    gpio_set_level(E32_M1_PIN, m1 ? 1 : 0);
+
+    /* Datasheet E32 cần một khoảng thời gian để chuyển mode. AUX HIGH nghĩa là module rảnh. */
+    vTaskDelay(pdMS_TO_TICKS(50));
+    esp_err_t aux = e32_wait_aux_high(E32_AUX_TIMEOUT_MS);
+
+    ESP_LOGI(TAG, "[LORA_CFG] Mode=%s M0=%d M1=%d AUX=%d (%s)",
+             mode_name, m0, m1, gpio_get_level(E32_AUX_PIN), esp_err_to_name(aux));
+}
+
+static esp_err_t e32_write_config_at_baud(int baud) {
+    ESP_LOGI(TAG, "[LORA_CFG] Thử ghi config E32 ở UART baud=%d", baud);
+
+    ESP_ERROR_CHECK(uart_set_baudrate(E32_UART_NUM, baud));
+    uart_flush_input(E32_UART_NUM);
+
+    /* Sleep/Config mode: M0=1, M1=1 */
+    e32_set_mode(1, 1, "SLEEP_CONFIG");
+    uart_flush_input(E32_UART_NUM);
+
+    uint8_t cfg[E32_CFG_PACKET_LEN] = {
+        E32_CMD_WRITE_FLASH,
+        E32_CFG_ADDH,
+        E32_CFG_ADDL,
+        E32_CFG_SPEED,
+        E32_CFG_CHAN,
+        E32_CFG_OPTION
+    };
+
+    ESP_LOGI(TAG, "[LORA_CFG] Gửi config:");
+    ESP_LOG_BUFFER_HEXDUMP(TAG, cfg, sizeof(cfg), ESP_LOG_INFO);
+
+    int wr = uart_write_bytes(E32_UART_NUM, cfg, sizeof(cfg));
+    uart_wait_tx_done(E32_UART_NUM, pdMS_TO_TICKS(500));
+
+    if (wr != sizeof(cfg)) {
+        ESP_LOGE(TAG, "[LORA_CFG] Gửi config thiếu byte: %d/%d", wr, (int)sizeof(cfg));
+        return ESP_FAIL;
+    }
+
+    /* Sau khi ghi config, module thường trả lại đúng 6 byte config. */
+    uint8_t resp[16] = {0};
+    int rd = uart_read_bytes(E32_UART_NUM, resp, sizeof(cfg), pdMS_TO_TICKS(1200));
+
+    ESP_LOGI(TAG, "[LORA_CFG] Phản hồi config rd=%d", rd);
+    if (rd > 0) {
+        ESP_LOG_BUFFER_HEXDUMP(TAG, resp, rd, ESP_LOG_INFO);
+    }
+
+    if (rd == sizeof(cfg) && memcmp(resp, cfg, sizeof(cfg)) == 0) {
+        ESP_LOGI(TAG, "[LORA_CFG] ✅ E32 nhận config OK ở baud=%d", baud);
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "[LORA_CFG] E32 chưa phản hồi đúng ở baud=%d", baud);
+    return ESP_FAIL;
+}
+
+/**
+ * @brief Cấu hình thông số mặc định cho mạch E32 khi khởi động.
+ * @details Thử 9600 trước vì E32 mặc định thường là 9600. Nếu module đã từng được
+ *          cấu hình sang 115200 thì thử tiếp 115200. Sau đó đưa module về Normal mode.
+ */
+static esp_err_t lora_e32_init_config(void) {
+    ESP_LOGI(TAG, "[LORA_CFG] Bắt đầu thiết lập module E32...");
+
+    esp_err_t err = e32_write_config_at_baud(E32_CONFIG_BAUD);
+    if (err != ESP_OK) {
+        err = e32_write_config_at_baud(E32_RUN_BAUD);
+    }
+
+    /* Normal mode: M0=0, M1=0 */
+    e32_set_mode(0, 0, "NORMAL");
+
+    /* Sau khi E32_CFG_SPEED=0x3A, UART của module chạy ở 115200. */
+    ESP_ERROR_CHECK(uart_set_baudrate(E32_UART_NUM, E32_RUN_BAUD));
+    uart_flush_input(E32_UART_NUM);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "[LORA_CFG] ✅ E32 đã sẵn sàng ở Normal mode, UART=%d", E32_RUN_BAUD);
+    } else {
+        ESP_LOGE(TAG, "[LORA_CFG] ❌ Không xác nhận được config E32. Vẫn chuyển sang Normal mode để nghe thử.");
+        ESP_LOGE(TAG, "[LORA_CFG] Kiểm tra dây TX/RX chéo, M0/M1/AUX, nguồn E32, baud hiện tại và channel.");
+    }
+
+    return err;
+}
+
+/**
+ * @brief Vòng lặp chính liên tục lắng nghe tín hiệu UART từ module LoRa E32.
+ */
 static void receiver_loop(void) {
     uint8_t rx[64], frame[E32_FRAME_LEN];
-    size_t  frame_pos = 0; 
+    size_t  frame_pos = 0;
     int64_t last_byte_time = 0;
 
-    ESP_LOGI(TAG, "[LORA_RX] Vòng lặp UART sẵn sàng. Kích thước Frame = %d byte.", E32_FRAME_LEN);
+    ESP_LOGI(TAG, "[LORA_RX] UART sẵn sàng. Frame=%d byte, RX pin=%d, TX pin=%d, baud=%d",
+             E32_FRAME_LEN, E32_UART_RX_PIN, E32_UART_TX_PIN, E32_RUN_BAUD);
 
     while (1) {
-        // Đọc từng khối byte từ UART
         int rd = uart_read_bytes(E32_UART_NUM, rx, sizeof(rx), pdMS_TO_TICKS(50));
         int64_t t_now = now_ms();
-        
+
         if (rd <= 0) {
-            // Xóa buffer nếu qua thời gian timeout mà chưa nhận đủ 1 frame
-            if (frame_pos > 0 && (t_now - last_byte_time) > 1000) frame_pos = 0;
+            if (frame_pos > 0 && (t_now - last_byte_time) > 1000) {
+                ESP_LOGW(TAG, "[LORA_RX] Timeout khi mới nhận %u/%d byte -> xóa frame dở",
+                         (unsigned)frame_pos, E32_FRAME_LEN);
+                frame_pos = 0;
+            }
             continue;
         }
 
-        // Ráp nối các mảnh byte thành 1 khung truyền hoàn chỉnh (18 byte)
+#if LORA_DEBUG_RAW_RX
+        ESP_LOGI(TAG, "[LORA_RX_RAW] rd=%d", rd);
+        ESP_LOG_BUFFER_HEXDUMP(TAG, rx, rd, ESP_LOG_INFO);
+#endif
+
         for (int i = 0; i < rd; ++i) {
             int64_t b = now_ms();
-            // Nếu có sự đứt quãng giữa các byte vượt mức cho phép, reset frame
-            if (frame_pos > 0 && (b - last_byte_time) > E32_FRAME_IDLE_MS) frame_pos = 0;
-            
+
+            if (frame_pos > 0 && (b - last_byte_time) > E32_FRAME_IDLE_MS) {
+                ESP_LOGW(TAG, "[LORA_RX] Idle gap %lld ms khi mới nhận %u/%d byte -> reset",
+                         (long long)(b - last_byte_time), (unsigned)frame_pos, E32_FRAME_LEN);
+                frame_pos = 0;
+            }
+
             frame[frame_pos++] = rx[i];
             last_byte_time = b;
-            
-            // Khi đủ chiều dài, gửi qua hàm Pipeline xử lý
-            if (frame_pos == E32_FRAME_LEN) { 
-                process_frame(frame); 
-                frame_pos = 0; 
+
+            if (frame_pos == E32_FRAME_LEN) {
+                ESP_LOGI(TAG, "[LORA_RX] Đủ 18 byte, xử lý frame:");
+                ESP_LOG_BUFFER_HEXDUMP(TAG, frame, E32_FRAME_LEN, ESP_LOG_INFO);
+                process_frame(frame);
+                frame_pos = 0;
             }
         }
     }
 }
 
-/**
- * @brief Cấu hình thông số mặc định cho mạch E32 khi khởi động.
- */
-static void lora_e32_init_config(void) {
-    ESP_LOGI(TAG, "[LORA_CFG] Bắt đầu thiết lập module E32...");
-    // Chuyển E32 vào chế độ Sleep/Config (M0=1, M1=1)
-    gpio_set_level(E32_M0_PIN, 1); 
-    gpio_set_level(E32_M1_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // Gửi lệnh cài đặt Hex
-    uint8_t cfg[6] = { E32_CMD_WRITE_FLASH, E32_CFG_ADDH, E32_CFG_ADDL,
-                       E32_CFG_SPEED, E32_CFG_CHAN, E32_CFG_OPTION };
-    uart_write_bytes(E32_UART_NUM, cfg, sizeof(cfg));
-    uart_wait_tx_done(E32_UART_NUM, pdMS_TO_TICKS(100));
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // Trả E32 về chế độ Hoạt động bình thường (M0=0, M1=0)
-    gpio_set_level(E32_M0_PIN, 0); 
-    gpio_set_level(E32_M1_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGI(TAG, "[LORA_CFG] E32 thiết lập thành công.");
+static void lora_receiver_task(void *pvParameters) {
+    (void)pvParameters;
+    receiver_loop();
+    vTaskDelete(NULL);
 }
 
 /* ==============================================================================
@@ -728,44 +865,74 @@ void app_main(void) {
     ESP_LOGI(TAG, "  TRẠM QUAN TRẮC MLR NOWCASTING (2H FORECAST)  ");
     ESP_LOGI(TAG, "================================================");
 
-    /* 1. Init các chân GPIO cho LoRa */
+    /* 0. NVS dùng cho WiFi + OTA. Khởi tạo một lần ở đầu chương trình. */
+    app_nvs_init();
+
+    /* 1. Init GPIO điều khiển LoRa E32 */
     gpio_set_direction(E32_M0_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(E32_M1_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(E32_M0_PIN, 0); 
-    gpio_set_level(E32_M1_PIN, 0);
+    gpio_set_direction(E32_AUX_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(E32_AUX_PIN, GPIO_FLOATING);
 
-    /* 2. Cài đặt UART 2 cho LoRa */
-    uart_driver_install(E32_UART_NUM, 2048, 512, 0, NULL, 0);
+    gpio_set_level(E32_M0_PIN, 0);
+    gpio_set_level(E32_M1_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    ESP_LOGI(TAG, "[PINOUT] E32_TX(GPIO%d)->RXD_E32, E32_RX(GPIO%d)<-TXD_E32, M0=%d, M1=%d, AUX=%d",
+             E32_UART_TX_PIN, E32_UART_RX_PIN, E32_M0_PIN, E32_M1_PIN, E32_AUX_PIN);
+
+    /* 2. Cài đặt UART2 cho LoRa. Ban đầu dùng 9600 để config được module factory. */
+    ESP_ERROR_CHECK(uart_driver_install(E32_UART_NUM, 4096, 1024, 0, NULL, 0));
     uart_config_t uc = {
-        .baud_rate  = 115200, 
+        .baud_rate  = E32_CONFIG_BAUD,
         .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE, 
+        .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE, 
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_param_config(E32_UART_NUM, &uc);
-    uart_set_pin(E32_UART_NUM, E32_UART_TX_PIN, E32_UART_RX_PIN, -1, -1);
+    ESP_ERROR_CHECK(uart_param_config(E32_UART_NUM, &uc));
+    ESP_ERROR_CHECK(uart_set_pin(E32_UART_NUM, E32_UART_TX_PIN, E32_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    uart_flush_input(E32_UART_NUM);
 
-    /* 3. Khởi động LoRa và kết nối Mạng */
-    lora_e32_init_config();
+    /* 3. Cấu hình E32: thử 9600 -> 115200, kiểm tra ACK, sau đó về Normal mode. */
+    esp_err_t lora_cfg_result = lora_e32_init_config();
+    if (lora_cfg_result != ESP_OK) {
+        ESP_LOGW(TAG, "[BOOT] LoRa config chưa xác nhận được. Xem log [LORA_CFG] để kiểm tra phần cứng.");
+    }
+
+    /* 4. Tạo Queue trước khi bật task nhận LoRa để không rớt dữ liệu. */
+    s_ai_data_queue = xQueueCreate(10, sizeof(AI_DataPoint_t));
+    s_supabase_queue = xQueueCreate(20, sizeof(SensorDecodedData_t));
+
+    if (!s_ai_data_queue || !s_supabase_queue) {
+        ESP_LOGE(TAG, "[BOOT] Không tạo được queue. Restart...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    }
+
+    /* 5. Bật task LoRa sớm, không chờ WiFi/NTP để tránh bỏ lỡ gói vô tuyến. */
+    xTaskCreatePinnedToCore(lora_receiver_task, "LORA_RX_TASK", 8192, NULL, 10, NULL, 0);
+
+    /* 6. Bật AI task. Supabase/OTA sẽ bật sau khi init WiFi. */
+    xTaskCreatePinnedToCore(ai_task, "AI_TASK", 8192, NULL, 5, NULL, 1);
+
+    /* 7. Kết nối mạng */
     wifi_init_sta();
 
-    /* 4. Khối lệnh chờ WiFi & Đồng bộ thời gian thực (NTP) */
-    // Block luồng này tối đa 30s để lấy IP
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
 
+    /* 8. Đồng bộ NTP. Nếu fail thì LoRa vẫn chạy, chỉ TLS/AI theo giờ có thể chưa chuẩn. */
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_setservername(1, "time.cloudflare.com"); // Server dự phòng
+    esp_sntp_setservername(1, "time.cloudflare.com");
     esp_sntp_init();
 
     int retry = 0;
-    const int retry_count = 20; 
+    const int retry_count = 20;
     time_t now = 0;
-    struct tm timeinfo = { 0 };
-    
-    // Đồng hồ xuất phát từ 1970. Chờ cho đến khi lấy được năm >= 2023 từ Internet
+    struct tm timeinfo = {0};
+
     while (timeinfo.tm_year < (2023 - 1900) && ++retry < retry_count) {
         ESP_LOGI(TAG, "[NTP] Chờ đồng bộ thời gian từ Internet (%d/%d)...", retry, retry_count);
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -774,25 +941,23 @@ void app_main(void) {
     }
 
     if (timeinfo.tm_year >= (2023 - 1900)) {
-        // Đồng bộ thành công, cài đặt múi giờ Việt Nam (UTC+7)
+        /* POSIX TZ: UTC-7 nghĩa là múi giờ thực tế UTC+7. */
         setenv("TZ", "UTC-7", 1);
         tzset();
         ESP_LOGI(TAG, "[NTP] ✅ Đồng hồ đã sync chuẩn.");
     } else {
-        ESP_LOGE(TAG, "[NTP] ❌ Đồng bộ thời gian thất bại. TLS sẽ gặp lỗi!");
+        ESP_LOGE(TAG, "[NTP] ❌ Đồng bộ thời gian thất bại. TLS có thể lỗi nếu đồng hồ sai.");
     }
-    
-    /* 5. Khởi tạo hàng đợi liên giao tiếp (Queues) */
-    s_ai_data_queue = xQueueCreate(10, sizeof(AI_DataPoint_t));
-    s_supabase_queue = xQueueCreate(10, sizeof(SensorDecodedData_t));
 
-    /* 6. Gán các Tasks ngầm chạy trên FreeRTOS */
-    xTaskCreatePinnedToCore(ai_task,  "AI_TASK",  8192, NULL, 5, NULL, 1);   // Core 1 (Tính toán AI)
-    xTaskCreatePinnedToCore(ota_task, "OTA_TASK", 8192, NULL, 4, NULL, 1);   // Core 1 (Kiểm tra bản cập nhật)
-    xTaskCreatePinnedToCore(supabase_task, "SBASE_TASK", 8192, NULL, 4, NULL, 0); // Core 0 (Đẩy dữ liệu HTTP)
+    /* 9. Bật task cloud sau khi network đã init. */
+    xTaskCreatePinnedToCore(supabase_task, "SBASE_TASK", 8192, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(ota_task, "OTA_TASK", 8192, NULL, 4, NULL, 1);
 
-    /* 7. Trả quyền Core 0 lại cho vòng lặp UART LoRa (Bảo vệ tính toàn vẹn Radio) */
-    vTaskPrioritySet(NULL, 10); 
-    receiver_loop();
+    ESP_LOGI(TAG, "[BOOT] Gateway đã chạy. Theo dõi log [LORA_RX_RAW] để biết UART có byte vào hay không.");
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
 }
+
 

@@ -1,226 +1,218 @@
-// app.js — IoTSenseHub Dashboard & MLOps Control Pipeline
+/**
+ * @file      app.js
+ * @brief     Luồng điều khiển chính và đồng bộ giao diện Web Dashboard (Realtime)
+ * @details   Kết nối cơ sở dữ liệu để cập nhật UI tức thời, quản lý watchdog tín hiệu và 
+ * triển khai hệ thống nạp firmware từ xa (OTA Update Pipeline).
+ */
+
 let prevData = null;
 
-function delta(cur, prev, unit = '') {
-  if (prev == null) return '—';
-  const d = cur - prev;
-  if (Math.abs(d) < 0.05) return '→ stable';
-  return d > 0
-    ? `▲ +${Math.abs(d).toFixed(1)}${unit} từ gói cũ`
-    : `▼ −${Math.abs(d).toFixed(1)}${unit} từ gói cũ`;
+/**
+ * @brief Tính toán xu hướng thay đổi giữa gói tin hiện tại và gói tin trước đó
+ * @param cur Giá trị hiện tại
+ * @param prev Giá trị trước đó
+ * @param unit Đơn vị đo đi kèm
+ */
+function calculateDelta(cur, prev, unit = '') {
+  if (prev == null) return '— Ổn định';
+  const diff = cur - prev;
+  if (Math.abs(diff) < 0.05) return '→ Không biến động';
+  return diff > 0
+    ? `▲ Tăng +${Math.abs(diff).toFixed(1)}${unit}`
+    : `▼ Giảm −${Math.abs(diff).toFixed(1)}${unit}`;
 }
 
-function setSub(id, txt) {
+/**
+ * @brief Cập nhật nhanh nội dung text của một thẻ HTML
+ */
+function setSubText(id, txt) {
   const el = document.getElementById(id);
   if (el) el.textContent = txt;
 }
 
-// -------------------------------------------------------------------
-// 1. HEARTBEAT MONITORING
-// -------------------------------------------------------------------
-function updateSensorStatusUI(latestData) {
+/* ═══════════════════════════════════════════════════════════════════
+ * 1. GIÁM SÁT TÍN HIỆU HEARTBEAT (WATCHDOG MONITOR)
+ * ═══════════════════════════════════════════════════════════════════ */
+function updateGatewayStatusUI(latestData) {
   const statusText = document.getElementById('sensor-status-text');
-  if (!statusText) return;
+  const heroInlineStatus = document.getElementById('hero-status-inline');
+  if (!statusText || !heroInlineStatus) return;
 
   if (!latestData || !latestData.created_at) {
     statusText.innerHTML = "⚫ CHƯA CÓ DỮ LIỆU";
     statusText.style.color = "var(--text-2)";
+    heroInlineStatus.innerHTML = "OFFLINE";
     return;
   }
 
+  // Tính khoảng cách thời gian (phút) kể từ lần cuối nhận dữ liệu
   const diffMinutes = (Date.now() - new Date(latestData.created_at).getTime()) / 60000;
 
   if (diffMinutes > 5) {
     statusText.innerHTML = `🔴 MẤT KẾT NỐI TÍN HIỆU (${Math.round(diffMinutes)} phút trước)`;
     statusText.style.color = "var(--red)";
-  } else if (latestData.temperature === 0 && latestData.humidity === 0) {
-    statusText.innerHTML = "🟡 LỖI ĐỌC CẢM BIẾN PHẦN CỨNG";
-    statusText.style.color = "var(--amber)";
+    heroInlineStatus.innerHTML = "DISCONNECTED";
+    heroInlineStatus.style.background = "rgba(239,68,68,0.1)";
+    heroInlineStatus.style.color = "var(--red)";
   } else {
-    statusText.innerHTML = "🟢 TRUYỀN DỮ LIỆU ỔN ĐỊNH";
+    statusText.innerHTML = "🟢 HỆ THỐNG HOẠT ĐỘNG ỔN ĐỊNH";
     statusText.style.color = "var(--green)";
+    heroInlineStatus.innerHTML = "ONLINE";
+    heroInlineStatus.style.background = "rgba(16,185,129,0.1)";
+    heroInlineStatus.style.color = "var(--green)";
   }
 }
 
-// -------------------------------------------------------------------
-// 2. MAIN UI RENDERER
-// -------------------------------------------------------------------
+/* ═══════════════════════════════════════════════════════════════════
+ * 2. CẬP NHẬT GIAO DIỆN (UI DATA RENDERER)
+ * ═══════════════════════════════════════════════════════════════════ */
 function updateUI(data) {
   if (!data) return;
 
-  const temp      = parseFloat(data.temperature)   || 0;
-  const hum       = parseFloat(data.humidity)       || 0;
-  const pres      = parseFloat(data.pressure)       || 0;
-  const bat       = parseFloat(data.battery)        || 0;
-  const boardTemp = parseFloat(data.board_temp)     || 0;
-  const bPress    = parseFloat(data.beta_pressure)  || 0;
-  const bHum      = parseFloat(data.beta_humidity)  || 0;
-  const pTemp     = parseFloat(data.predicted_temp) || 0;
-
-  // Helper: set value keeping inner .unit span
-  function setVal(id, num, dec) {
-    const el = document.getElementById(id);
-    if (!el) return;
-    const unitEl = el.querySelector('.unit');
-    const unitHTML = unitEl ? unitEl.outerHTML : '';
-    el.innerHTML = num.toFixed(dec) + unitHTML;
-  }
-
-  // Sensor metrics
-  setVal('temperature', temp, 1);
-  setVal('humidity',    hum,  1);
-  setVal('pressure',    pres, 1);
-  setVal('battery',     bat,  2);
-  setVal('board_temp',  boardTemp, 1);
-
-  // Edge AI values
-  const bPresEl = document.getElementById('beta_pressure');
-  if (bPresEl) bPresEl.textContent = bPress >= 0 ? `+${bPress.toFixed(4)}` : bPress.toFixed(4);
-
-  const bHumEl = document.getElementById('beta_humidity');
-  if (bHumEl) bHumEl.textContent = bHum >= 0 ? `+${bHum.toFixed(4)}` : bHum.toFixed(4);
-
-  setVal('predicted_temp', pTemp, 1);
-
-  // Trend
-  const trendEl = document.getElementById('trend');
-  if (trendEl) trendEl.textContent = data.pressure_trend || '--';
-
-  // Alert system
-  const warnEl   = document.getElementById('warning');
-  const statCard = document.getElementById('statusCard');
-  const isStorm  = data.storm_warning;
-  const isFrost  = data.frost_warning;
-
-  if (warnEl) {
-    if (isStorm && isFrost) {
-      warnEl.innerHTML = '<span style="color:var(--red)">⚠ DÔNG LỐC & SƯƠNG MÙ</span>';
-      if (statCard) statCard.className = 'metric-card mc-status storm';
-    } else if (isStorm) {
-      warnEl.innerHTML = '<span style="color:var(--red)">⚠ CẢNH BÁO DÔNG LỐC</span>';
-      if (statCard) statCard.className = 'metric-card mc-status storm';
-    } else if (isFrost) {
-      warnEl.innerHTML = '<span style="color:#38bdf8">❄ CẢNH BÁO SƯƠNG GIÁ</span>';
-      if (statCard) statCard.className = 'metric-card mc-status frost';
-    } else {
-      warnEl.innerHTML = '<span style="color:var(--green)">✓ HỆ THỐNG AN TOÀN</span>';
-      if (statCard) statCard.className = 'metric-card mc-status';
+  // Cập nhật các thông số cảm biến cơ bản
+  const fields = ['temperature', 'humidity', 'pressure', 'predicted_temp_2h', 'device_id'];
+  fields.forEach(f => {
+    const el = document.getElementById(f);
+    if (el) {
+      if (typeof data[f] === 'number') {
+        el.textContent = f === 'pressure' ? data[f].toFixed(0) : data[f].toFixed(1);
+      } else {
+        el.textContent = data[f] ?? '--';
+      }
     }
+  });
+
+  // Cập nhật thông số PIN từ INA219
+  const batEl = document.getElementById('battery');
+  if (batEl) {
+    batEl.textContent = data.battery != null ? parseFloat(data.battery).toFixed(2) : '--';
   }
 
-  // Sub-texts
-  setSub('tempSub',      delta(temp, prevData?.temperature, '°C'));
-  setSub('humSub',       delta(hum,  prevData?.humidity,    '%'));
-  setSub('boardTempSub', `Biến thiên mạch: ${delta(boardTemp, prevData?.board_temp, '°C')}`);
-  setSub('presSub',      `${pres < 1000 ? 'Áp suất thấp' : pres > 1020 ? 'Áp suất cao' : 'Ổn định'} · ${delta(pres, prevData?.pressure, ' hPa')}`);
-  setSub('predictedSub', temp_slope_text(temp, pTemp));
-  setSub('statusSub',    `Mã thiết bị biên: ${data.device_id || 'unknown'}`);
+  const pktEl = document.getElementById('packetCounter');
+  if (pktEl) {
+    pktEl.textContent = data.frame_counter != null ? `#${data.frame_counter}` : '--';
+  }
 
-  // Header chips
-  const devEl = document.getElementById('deviceChip');
-  if (devEl) devEl.textContent = data.device_id || 'unknown';
+  const devEl = document.getElementById('deviceId');
+  if (devEl) {
+    devEl.textContent = data.device_id ?? 'N/A';
+  }
 
-  const updEl = document.getElementById('updated');
-  if (updEl) updEl.textContent = new Date(data.created_at).toLocaleString('vi-VN');
+  // Quản lý trạng thái Pin yếu trực quan
+  const batCard = document.getElementById('batCard');
+  if (batCard && data.battery != null) {
+    batCard.classList.toggle('low', data.battery < 3.6);
+    setSubText('batSub', data.battery >= 4.0 ? '🟢 Đầy Nguồn' : data.battery >= 3.6 ? '🟡 Tốt' : '🔴 Cạn Nguồn - Cần Sạc');
+  } else if (data.battery == null) {
+    setSubText('batSub', '❌ Lỗi cảm biến INA219');
+  }
 
-  const luEl = document.getElementById('lastUpdateChip');
-  if (luEl) luEl.textContent = new Date(data.created_at).toLocaleTimeString('vi-VN', { hour12: false });
+  // Tính toán delta và kết xuất ra màn hình xu hướng thay đổi
+  if (prevData) {
+    setSubText('tempSub', calculateDelta(data.temperature, prevData.temperature, '°C'));
+    setSubText('humSub',  calculateDelta(data.humidity,    prevData.humidity, '%'));
+    setSubText('presSub', calculateDelta(data.pressure,    prevData.pressure, ' hPa'));
+    
+    // Xu hướng của mô hình AI dự báo
+    const aiDiff = data.predicted_temp_2h - data.temperature;
+    setSubText('predTempSub', `Dự báo nhiệt độ lệch đối lưu: ${aiDiff > 0 ? '+' : ''}${aiDiff.toFixed(1)}°C`);
+  }
 
-  updateSensorStatusUI(data);
+  updateGatewayStatusUI(data);
   prevData = data;
 }
 
-function temp_slope_text(cur, pred) {
-  const diff = pred - cur;
-  if (Math.abs(diff) < 0.2) return "Nhiệt độ đứng yên";
-  return diff > 0
-    ? `Nhiệt độ dự kiến tăng lên ${pred.toFixed(1)}°C`
-    : `Nhiệt độ dự kiến giảm sâu xuống ${pred.toFixed(1)}°C`;
-}
+/* ═══════════════════════════════════════════════════════════════════
+ * 3. HỆ THỐNG ĐẨY FIRMWARE QUA MẠNG (OTA PIPELINE)
+ * ═══════════════════════════════════════════════════════════════════ */
+async function handleOTAPipeline() {
+  const fileInput = document.getElementById('firmwareFile');
+  const logEl     = document.getElementById('otaLog');
+  if (!fileInput || !logEl) return;
 
-// -------------------------------------------------------------------
-// 3. OTA FIRMWARE UPLOAD (MLOps)
-// -------------------------------------------------------------------
-async function uploadAndDeployFirmware() {
-  const fileInput = document.getElementById('otaFileInput');
-  const logEl     = document.getElementById('otaStatusLog');
-
-  if (!fileInput || fileInput.files.length === 0) {
-    alert("Vui lòng chọn một file firmware .bin từ máy tính trước!");
+  const file = fileInput.files[0];
+  if (!file) {
+    logEl.textContent = "⚠ Vui lòng chọn file firmware dạng .bin trước!";
+    logEl.style.color = "var(--orange)";
     return;
   }
 
-  const file           = fileInput.files[0];
-  const uniqueFileName = `firmware_${Date.now()}.bin`;
-
-  logEl.textContent  = "⏳ Bước 1/3: Đang đẩy file .bin lên Supabase Storage...";
-  logEl.style.color  = "var(--amber)";
-
   try {
-    const { error: storageError } = await supabaseClient
-      .storage.from('firmware')
-      .upload(uniqueFileName, file, { cacheControl: '0', upsert: true });
+    logEl.innerHTML = "⏳ Đang tạo gói tin bảo mật và tải lên Cloud Storage...";
+    logEl.style.color = "var(--text-2)";
 
-    if (storageError) throw storageError;
+    const fileName = `firmware_${Date.now()}.bin`;
+    const { data: uploadData, error: uploadError } = await supabaseClient
+      .storage
+      .from('ota-binaries')
+      .upload(fileName, file);
 
-    logEl.textContent = "⏳ Bước 2/3: Đã lưu file. Đang mở liên kết công khai...";
+    if (uploadError) throw uploadError;
 
-    const { data: urlData } = supabaseClient
-      .storage.from('firmware').getPublicUrl(uniqueFileName);
+    // Lấy Public URL của tệp nhị phân vừa tải lên
+    const { data: { publicUrl } } = supabaseClient
+      .storage
+      .from('ota-binaries')
+      .getPublicUrl(fileName);
 
-    const publicUrl = urlData.publicUrl;
-    console.log("[MLOps] Public URL:", publicUrl);
+    logEl.innerHTML = "⏳ Thực hiện cấu hình thiết bị ngầm (Upsert Config)...";
 
-    logEl.textContent = "⏳ Bước 3/3: Đang ghi URL vào CSDL để kích hoạt vi điều khiển...";
-
+    // Ghi đè cấu hình lệnh OTA vào bảng device_configs để ESP32 kéo về
     const { error: dbError } = await supabaseClient
       .from('device_configs')
       .upsert([{ device_id: "ESP32_LORA_GW", ota_url: publicUrl, updated_at: new Date().toISOString() }]);
 
     if (dbError) throw dbError;
 
-    logEl.innerHTML = `✅ <b>PHÁT LỆNH THÀNH CÔNG!</b><br>` +
-      `• File đã nằm an toàn trên Đám mây.<br>` +
-      `• Hệ thống đã phát sóng tín hiệu lệnh OTA ngầm.<br>` +
-      `<span style="font-size:0.62rem;color:var(--text-2);">Link: ${publicUrl}</span>`;
+    logEl.innerHTML = `✅ <b>PHÁT LỆNH OTA THÀNH CÔNG!</b><br>` +
+      `• File nhị phân đã nằm an toàn trên Đám mây.<br>` +
+      `• Hệ thống đã phát tín hiệu hiệu năng cập nhật ngầm.<br>` +
+      `<span style="font-size:0.62rem;color:var(--text-2);">Đường dẫn: ${publicUrl}</span>`;
     logEl.style.color = "var(--green)";
     fileInput.value   = "";
 
   } catch (err) {
-    console.error('[OTA Error]:', err);
-    logEl.textContent = `❌ LỖI HỆ THỐNG: ${err.message}`;
+    console.error('[OTA Pipeline Error]:', err);
+    logEl.textContent = `❌ LỖI HỆ THỐNG PIPELINE: ${err.message}`;
     logEl.style.color = "var(--red)";
   }
 }
 
-// -------------------------------------------------------------------
-// 4. BOOTSTRAP
-// -------------------------------------------------------------------
-async function fetchLatest() {
+/* ═══════════════════════════════════════════════════════════════════
+ * 4. KHỞI CHẠY HỆ THỐNG VÀ ĐĂNG KÝ REALTIME
+ * ═══════════════════════════════════════════════════════════════════ */
+async function fetchLatestRecord() {
   const { data, error } = await supabaseClient
     .from(CONFIG.API.TABLE)
     .select('*')
     .order('created_at', { ascending: false })
     .limit(1);
-  if (error) { console.error('[App] fetch error:', error); return null; }
+  if (error) { console.error('[App] Lỗi nạp bản ghi gốc:', error); return null; }
   return data?.[0] ?? null;
 }
 
 async function initDashboard() {
-  const latest = await fetchLatest();
+  // Lấy cấu hình đưa lên Modal hiển thị
+  document.getElementById('cfgMode').textContent  = CONFIG.MODE;
+  document.getElementById('cfgTable').textContent = CONFIG.API.TABLE;
+  document.getElementById('cfgUrl').textContent   = CONFIG.SUPABASE_URL;
+  document.getElementById('cfgLimit').textContent = CONFIG.FETCH_LIMIT;
+  document.getElementById('cfgMode').className   = "badge " + CONFIG.MODE.toLowerCase();
+
+  // Đọc dữ liệu mới nhất để render giao diện ngay lập tức khi load trang
+  const latest = await fetchLatestRecord();
   if (latest) updateUI(latest);
 
-  subscribeRealtime((row) => {
-    console.log('[App] Realtime:', row);
-    updateUI(row);
+  // Đăng ký nhận sự kiện WebSocket từ Supabase Realtime Engine
+  subscribeRealtime((newRow) => {
+    console.log('[Realtime RX]:', newRow);
+    updateUI(newRow);
   });
 
-  // Watchdog: kiểm tra tín hiệu mỗi 30 giây
+  // Watchdog ngầm kiểm tra mất kết nối định kỳ mỗi 15 giây
   setInterval(() => {
-    if (prevData) updateSensorStatusUI(prevData);
-  }, 30000);
+    if (prevData) updateGatewayStatusUI(prevData);
+  }, 15000);
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-  initDashboard();
-});
+document.addEventListener('DOMContentLoaded', initDashboard);
