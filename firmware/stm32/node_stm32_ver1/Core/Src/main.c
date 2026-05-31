@@ -1,623 +1,1009 @@
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-#include <time.h>
-#include <sys/time.h>
-#include <math.h>
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "freertos/timers.h"
-#include "freertos/queue.h"
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
 
-#include "driver/gpio.h"
-#include "driver/uart.h"
-
-#include "esp_err.h"
-#include "esp_log.h"
-#include "esp_check.h"
-#include "esp_timer.h"
-#include "esp_event.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
-#include "esp_http_client.h"
-#include "esp_https_ota.h"
-#include "esp_ota_ops.h"
-#include "esp_crt_bundle.h"
-#include "esp_sntp.h"
-#include "nvs_flash.h"
-#include "nvs.h"
-#include "cJSON.h"
-#include <bootloader_common.h>
-
+#include "sensor_hal.h"
+#include "api.h"
 #include "crypto_aead.h"
+#include "sensors.h"
+#include <string.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+#define SENSOR_POWER_SETTLE_MS      20U
+#define SENSOR_MEASURE_WAIT_MS      150U
 
 /*
- * ════════════════════════════════════════════════════════════════════
- * ROOT CA CERT NHÚNG TRỰC TIẾP (TLS DualLayer Strategy)
- * ════════════════════════════════════════════════════════════════════
+ * Test mode:
+ * - IWDG timeout is about 25s with LSI around 40kHz, prescaler 256, reload 3906.
+ * - RTC heartbeat must be lower than IWDG timeout.
+ * - TX every 30s = 3 heartbeats x 10s.
  */
-extern const char supabase_root_ca_pem_start[] asm("_binary_supabase_root_ca_pem_start");
-extern const char supabase_root_ca_pem_end[]   asm("_binary_supabase_root_ca_pem_end");
+#define APP_RTC_HEARTBEAT_SEC       10U
+#define APP_TX_PERIOD_SEC           30U
+#define APP_TX_HEARTBEATS           (APP_TX_PERIOD_SEC / APP_RTC_HEARTBEAT_SEC)
 
-#define TLS_ONLY_BUNDLE_MODE  0
+#define BKP_MAGIC_VALUE             0xA55AU
+#define BKP_REG_MAGIC               RTC_BKP_DR1
+#define BKP_REG_FRAME_COUNTER_LO    RTC_BKP_DR2
+#define BKP_REG_FRAME_COUNTER_HI    RTC_BKP_DR3
+#define BKP_REG_HEARTBEAT_COUNT     RTC_BKP_DR4
+/* USER CODE END PD */
 
-/* ─────────────────────────── PIN / UART CONFIG ─────────────────────────── */
-#define E32_UART_NUM          UART_NUM_2
-#define E32_UART_TX_PIN       GPIO_NUM_17
-#define E32_UART_RX_PIN       GPIO_NUM_18
-#define E32_M0_PIN            GPIO_NUM_37
-#define E32_M1_PIN            GPIO_NUM_38
-#define E32_AUX_PIN           GPIO_NUM_39
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
 
-#define E32_FRAME_LEN         18
-#define E32_FRAME_IDLE_MS     150
-#define SENSOR_PLAINTEXT_LEN  10
-#define ASCON_TAG4_LEN        4
-#define ASCON_INPUT_LEN       (SENSOR_PLAINTEXT_LEN + ASCON_TAG4_LEN)
+/* USER CODE END PM */
 
-/* ─────────────────────────── E32 LORA CONFIG ───────────────────────────── */
-#define E32_CFG_ADDH          0x00
-#define E32_CFG_ADDL          0x17
-#define E32_CFG_SPEED         0x3A
-#define E32_CFG_CHAN          0x17
-#define E32_CFG_OPTION        0x44
-#define E32_CMD_WRITE_FLASH   0xC0
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c2;
 
-/* ─────────────────────────── WIFI CONFIG ───────────────────────────────── */
-typedef struct { const char *ssid; const char *pass; } wifi_cred_t;
-static const wifi_cred_t s_wifi_list[] = {
-    {"Truong Lung",   "12345678"},
-    {"LUCAS",         "12345678"},
-    {"Phòng toàn trai đẹp", "aicungdeptrai<3"}
-};
-static const int NUM_WIFIS = sizeof(s_wifi_list) / sizeof(s_wifi_list[0]);
-static int           s_wifi_idx       = 0;
-static TimerHandle_t s_wifi_timer     = NULL;
-static bool          s_wifi_connected = false;
-#define WIFI_CONNECTED_BIT    BIT0
+IWDG_HandleTypeDef hiwdg;
 
-/* ─────────────────────────── SUPABASE CONFIG ───────────────────────────── */
-#define SUPABASE_URL      "https://hbuluhjjfivezrrxesaz.supabase.co"
-#define SUPABASE_TABLE    "weather_logs"
-#define SUPABASE_ANON_KEY \
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." \
-    "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhidWx1" \
-    "aGpqZml2ZXpycnhlc2F6Iiwicm9sZSI6ImFub24i" \
-    "LCJpYXQiOjE3Nzg1MDE4MDksImV4cCI6MjA5NDA3" \
-    "NzgwOX0.KhjB0T-8Yy34P3p37XipEutwVfraabsG274NL_88J4Q"
-#define DEVICE_ID         "ESP32_LORA_GW"
+RTC_HandleTypeDef hrtc;
 
-#define HTTP_POST_TIMEOUT_MS    8000
-#define HTTP_GET_TIMEOUT_MS    10000
-#define HTTP_OTA_TIMEOUT_MS    60000
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
 
-/* ─────────────────────────── MLOps GLOBALS ─────────────────────────────── */
-typedef struct {
-    float pressure;
-    float humidity;
-    float temperature;
-} AI_DataPoint_t;
-
-/* Ký hiệu Queues của FreeRTOS */
-static QueueHandle_t s_ai_data_queue = NULL;
-static QueueHandle_t s_supabase_queue = NULL;
-
-/* Biến Hồi quy đa biến (MLR) - Dự báo nhiệt độ 2 tiếng */
-static float g_mlr_predicted_temp_2h = 0.0f;
-
-/* ─────────────────────────── SENSOR STRUCTS ────────────────────────────── */
-#define ERR_SHT30   (1U << 0)
-#define ERR_BMP388  (1U << 1)
-#define ERR_VBAT    (1U << 2)
-
-typedef struct __attribute__((packed)) {
-    int16_t  env_temp_raw;
-    uint16_t env_hum_raw;
-    uint16_t air_press_raw;
-    int16_t  board_temp_raw;
-    uint8_t  batt_volt_raw;
-    uint8_t  health_flag;
-} SensorPayloadRaw_t;
-
-typedef struct {
-    uint32_t frame_counter;
-    float    env_temp_c;
-    float    env_humidity_pct;
-    float    air_pressure_hpa;
-    float    board_temp_c;      
-    float    battery_volt;
-    uint8_t  health_flag;       
-    bool     sht30_ok;
-    bool     bmp388_ok;
-    bool     payload_ok;
-    bool     ina219_ok;
-} SensorDecodedData_t;
-
-static const char *TAG = "WEATHER_GATEWAY";
-static EventGroupHandle_t s_wifi_event_group = NULL;
-
+/* USER CODE BEGIN PV */
 static const uint8_t ASCON_SECRET_KEY[16] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
+typedef char check_sensor_payload_size[(sizeof(SensorData_t) == 10U) ? 1 : -1];
+typedef char check_lora_frame_size[(sizeof(LoRaTxFrame_t) == 18U) ? 1 : -1];
 
-/* ═══════════════════════════════════════════════════════════════════
- * HELPER: Tạo esp_http_client_config_t đúng chuẩn TLS cho Supabase
- * ═══════════════════════════════════════════════════════════════════ */
-static void tls_cfg_fill(esp_http_client_config_t *cfg)
+
+//static uint32_t g_tx_elapsed_sec = 0U;
+static uint32_t g_frame_counter = 0U;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_I2C2_Init(void);
+static void MX_IWDG_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_RTC_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+static void Error_Handler_Print_And_Stop(const char *msg);
+static void debug_dump_hex(const char *prefix, const uint8_t *data, uint16_t len)
 {
-    cfg->cert_pem = supabase_root_ca_pem_start;
-    cfg->crt_bundle_attach = NULL;
+    uint16_t i;
+
+    if ((prefix == NULL) || (data == NULL)) {
+        return;
+    }
+
+    sensor_debug_print("%s (%uB):", prefix, (unsigned)len);
+    for (i = 0U; i < len; i++) {
+        sensor_debug_print(" %02X", data[i]);
+    }
+    sensor_debug_print("\r\n");
 }
+/* Hàm phục hồi Bus I2C (Giải cứu cảm biến bị kẹt) */
+void I2C_Recover_Bus(GPIO_TypeDef* SCL_Port, uint16_t SCL_Pin, GPIO_TypeDef* SDA_Port, uint16_t SDA_Pin)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-static int64_t now_ms(void) { return esp_timer_get_time() / 1000LL; }
+    // 1. Cấu hình SCL và SDA thành Output Open-Drain tạm thời
+    GPIO_InitStruct.Pin = SCL_Pin | SDA_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(SCL_Port, &GPIO_InitStruct); // Chú ý: Cần Init đúng Port (vd GPIOB)
 
-static inline float battery_raw_to_volt(uint8_t raw) {
-    return 3.0f + ((float)raw / 255.0f) * (4.2f - 3.0f);
-}
+    HAL_GPIO_WritePin(SCL_Port, SCL_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(SDA_Port, SDA_Pin, GPIO_PIN_SET);
+    HAL_Delay(1);
 
-/* ═══════════════════════════════════════════════════════════════════
- * AI EDGE COMPUTING — Core 1 (Chỉ chạy MLR)
- * ═══════════════════════════════════════════════════════════════════ */
-static void ai_task(void *pvParameters) {
-    ESP_LOGI(TAG, "[AI_ENGINE] Core %d", xPortGetCoreID());
-
-    while (1) {
-        AI_DataPoint_t dp;
-        if (xQueueReceive(s_ai_data_queue, &dp, portMAX_DELAY) == pdPASS) {
-            
-            /* ---- MÔ HÌNH MLR DỰ BÁO NHIỆT ĐỘ 2 TIẾNG TỚI ---- */
-            time_t now;
-            struct tm timeinfo;
-            time(&now);
-            localtime_r(&now, &timeinfo);
-            int current_hour = timeinfo.tm_hour;
-
-            float C_COEF, M1_HUM, M2_PRESS;
-            
-            // Lựa chọn bộ hệ số theo thời gian thực (Ngày hoặc Đêm)
-            if (current_hour >= 6 && current_hour < 18) {
-                // Hệ số ban ngày
-                C_COEF = 28.5f; M1_HUM = -0.15f; M2_PRESS = 0.08f;
-            } else {
-                // Hệ số ban đêm
-                C_COEF = 22.0f; M1_HUM = -0.05f; M2_PRESS = 0.02f;
-            }
-
-            g_mlr_predicted_temp_2h = C_COEF + (M1_HUM * dp.humidity) + (M2_PRESS * dp.pressure);
-            
-            ESP_LOGI(TAG, "[MLR_MODEL] Giờ: %d -> Dự báo nhiệt độ 2h tới: %.2f°C", current_hour, g_mlr_predicted_temp_2h);
+    // 2. Tạo tối đa 9 xung clock trên SCL để ép Slave nhả SDA
+    for (int i = 0; i < 9; i++) {
+        // Kiểm tra xem chân SDA đã được nhả lên HIGH chưa
+        if (HAL_GPIO_ReadPin(SDA_Port, SDA_Pin) == GPIO_PIN_SET) {
+            break; // Bus đã rảnh, thoát vòng lặp
         }
+
+        // Kéo SCL xuống LOW rồi lên HIGH (Tạo 1 xung clock)
+        HAL_GPIO_WritePin(SCL_Port, SCL_Pin, GPIO_PIN_RESET);
+        HAL_Delay(1);
+        HAL_GPIO_WritePin(SCL_Port, SCL_Pin, GPIO_PIN_SET);
+        HAL_Delay(1);
+    }
+
+    // 3. Tạo tín hiệu STOP ảo để reset trạng thái của tất cả Slave
+    HAL_GPIO_WritePin(SCL_Port, SCL_Pin, GPIO_PIN_RESET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SDA_Port, SDA_Pin, GPIO_PIN_RESET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SCL_Port, SCL_Pin, GPIO_PIN_SET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(SDA_Port, SDA_Pin, GPIO_PIN_SET);
+    HAL_Delay(1);
+}
+static uint8_t lora_cfg_is_target(const uint8_t cfg[6])
+{
+    return (cfg[0] == 0xC0 &&
+            cfg[1] == 0x00 &&
+            cfg[2] == 0x17 &&
+            cfg[3] == 0x3A &&
+            cfg[4] == 0x17 &&
+            cfg[5] == 0x44);
+}
+
+static void App_Delay_With_Watchdog(uint32_t ms)
+{
+    uint32_t start = HAL_GetTick();
+
+    while ((HAL_GetTick() - start) < ms) {
+        HAL_IWDG_Refresh(&hiwdg);
+        HAL_Delay(20);
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * SUPABASE POST FUNCTION
- * ═══════════════════════════════════════════════════════════════════ */
-static void supabase_post_sensor(const SensorDecodedData_t *d) {
-    if (!s_wifi_connected) return;
+static uint8_t Edge_Crypto_Pack(const SensorData_t *raw_data,
+                                uint32_t counter,
+                                LoRaTxFrame_t *tx_frame)
+{
+    uint8_t plaintext[sizeof(SensorData_t)];
+    uint8_t ascon_output[sizeof(SensorData_t) + 16U];
+    uint8_t nonce[16] = {0};
+    unsigned long long clen = 0ULL;
+    int ret;
 
-    char bat_str[16];
-    if (d->ina219_ok) {
-        snprintf(bat_str, sizeof(bat_str), "%.3f", d->battery_volt);
-    } else {
-        strcpy(bat_str, "null"); 
+    if ((raw_data == NULL) || (tx_frame == NULL)) {
+        return SENSOR_ERR;
     }
-    
-    char body[512];
-    int body_len = snprintf(body, sizeof(body),
-        "{"
-        "\"frame_counter\":%"PRIu32","      
-        "\"temperature\":%.2f,"
-        "\"humidity\":%.2f,"
-        "\"pressure\":%.2f,"
-        "\"board_temp\":%.2f,"                
-        "\"battery\":%s,"
-        "\"predicted_temp_2h\":%.2f,"
-        "\"device_id\":\"%s\""
-        "}",
-        d->frame_counter,                   
-        d->sht30_ok  ? d->env_temp_c       : 0.0f,
-        d->sht30_ok  ? d->env_humidity_pct : 0.0f,
-        d->bmp388_ok ? d->air_pressure_hpa : 0.0f,
-        d->board_temp_c,                    
-        bat_str, 
-        g_mlr_predicted_temp_2h, 
-        DEVICE_ID
+
+    memset(tx_frame, 0, sizeof(*tx_frame));
+    memcpy(plaintext, raw_data, sizeof(plaintext));
+
+    nonce[0] = (uint8_t)(counter >> 24);
+    nonce[1] = (uint8_t)(counter >> 16);
+    nonce[2] = (uint8_t)(counter >> 8);
+    nonce[3] = (uint8_t)(counter);
+
+    nonce[4] = 0x57U;
+    nonce[5] = 0x53U;
+    nonce[6] = 0x4EU;
+    nonce[7] = 0x31U;
+
+    ret = crypto_aead_encrypt(
+        ascon_output, &clen,
+        plaintext, sizeof(plaintext),
+        NULL, 0,
+        NULL,
+        nonce,
+        ASCON_SECRET_KEY
     );
 
-    ESP_LOGI(TAG, "[SUPABASE] POST: %s", body);
-
-    char url[160];
-    snprintf(url, sizeof(url), "%s/rest/v1/%s", SUPABASE_URL, SUPABASE_TABLE);
-
-    esp_http_client_config_t http_cfg = {
-        .url               = url,
-        .method            = HTTP_METHOD_POST,
-        .timeout_ms        = HTTP_POST_TIMEOUT_MS,
-        .buffer_size       = 4096,
-        .buffer_size_tx    = 2048,
-        .keep_alive_enable = true,
-    };
-    tls_cfg_fill(&http_cfg); 
-
-    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
-    if (!client) { ESP_LOGE(TAG, "[SUPABASE] init failed"); return; }
-
-    esp_http_client_set_header(client, "Content-Type",  "application/json");
-    esp_http_client_set_header(client, "apikey",        SUPABASE_ANON_KEY);
-    esp_http_client_set_header(client, "Authorization", "Bearer " SUPABASE_ANON_KEY);
-    esp_http_client_set_header(client, "Prefer",        "return=minimal");
-    esp_http_client_set_post_field(client, body, body_len);
-
-    esp_err_t err = esp_http_client_perform(client);
-    if (err == ESP_OK) {
-        int st = esp_http_client_get_status_code(client);
-        if (st == 201 || st == 200)
-            ESP_LOGI(TAG, "[SUPABASE] ✅ HTTP %d", st);
-        else
-            ESP_LOGW(TAG, "[SUPABASE] ⚠ HTTP %d — kiểm tra RLS/table", st);
-    } else {
-        ESP_LOGE(TAG, "[SUPABASE] ❌ %s", esp_err_to_name(err));
+    if ((ret != 0) || (clen < ((unsigned long long)sizeof(plaintext) + 4ULL))) {
+        sensor_debug_print("[ASCON] Encrypt FAILED, skip TX\r\n");
+        return SENSOR_ERR;
     }
-    esp_http_client_cleanup(client);
+
+    tx_frame->frame_counter = counter;
+    memcpy(tx_frame->ciphertext, &ascon_output[0], sizeof(tx_frame->ciphertext));
+    memcpy(tx_frame->mac_tag, &ascon_output[sizeof(tx_frame->ciphertext)], sizeof(tx_frame->mac_tag));
+
+    return SENSOR_OK;
 }
 
-static void supabase_task(void *pvParameters) {
-    SensorDecodedData_t data_to_post;
+/* Backup register helpers --------------------------------------------------*/
 
-    while (1) {
-        if (xQueueReceive(s_supabase_queue, &data_to_post, portMAX_DELAY) == pdPASS) {
-            supabase_post_sensor(&data_to_post);
-        }
+static void App_Backup_Enable(void)
+{
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_RCC_BKP_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+}
+
+static uint32_t App_BKP_Read32(uint32_t reg_lo, uint32_t reg_hi)
+{
+    uint32_t lo = HAL_RTCEx_BKUPRead(&hrtc, reg_lo) & 0xFFFFU;
+    uint32_t hi = HAL_RTCEx_BKUPRead(&hrtc, reg_hi) & 0xFFFFU;
+
+    return lo | (hi << 16);
+}
+
+static void App_BKP_Write32(uint32_t reg_lo, uint32_t reg_hi, uint32_t value)
+{
+    HAL_RTCEx_BKUPWrite(&hrtc, reg_lo, value & 0xFFFFU);
+    HAL_RTCEx_BKUPWrite(&hrtc, reg_hi, (value >> 16) & 0xFFFFU);
+}
+
+static void App_Backup_Init_If_Needed(void)
+{
+    App_Backup_Enable();
+
+    if (HAL_RTCEx_BKUPRead(&hrtc, BKP_REG_MAGIC) != BKP_MAGIC_VALUE) {
+        HAL_RTCEx_BKUPWrite(&hrtc, BKP_REG_MAGIC, BKP_MAGIC_VALUE);
+        App_BKP_Write32(BKP_REG_FRAME_COUNTER_LO, BKP_REG_FRAME_COUNTER_HI, 0U);
+        HAL_RTCEx_BKUPWrite(&hrtc, BKP_REG_HEARTBEAT_COUNT, 0U);
+
+        sensor_debug_print("[BKP] Init backup registers\r\n");
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * OTA ENGINE — Core 1
- * ═══════════════════════════════════════════════════════════════════ */
-static esp_err_t fetch_supabase_ota_url(char *out_url, size_t max_len) {
-    char url[256];
-    snprintf(url, sizeof(url),
-             "%s/rest/v1/device_configs?device_id=eq.%s&select=ota_url",
-             SUPABASE_URL, DEVICE_ID);
-
-    esp_http_client_config_t http_cfg = {
-        .url            = url,
-        .method         = HTTP_METHOD_GET,
-        .timeout_ms     = HTTP_GET_TIMEOUT_MS,
-        .buffer_size    = 4096,
-    };
-    tls_cfg_fill(&http_cfg);
-
-    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
-    if (!client) return ESP_FAIL;
-
-    esp_http_client_set_header(client, "apikey",        SUPABASE_ANON_KEY);
-    esp_http_client_set_header(client, "Authorization", "Bearer " SUPABASE_ANON_KEY);
-
-    if (esp_http_client_open(client, 0) != ESP_OK) {
-        esp_http_client_cleanup(client);
-        return ESP_FAIL;
-    }
-
-    int content_length = esp_http_client_fetch_headers(client);
-    if (content_length <= 0) content_length = 2048;
-
-    char *buf = malloc(content_length + 1);
-    if (!buf) { esp_http_client_cleanup(client); return ESP_ERR_NO_MEM; }
-
-    int read_len = esp_http_client_read(client, buf, content_length);
-    esp_http_client_cleanup(client);
-
-    if (read_len <= 0) { free(buf); return ESP_FAIL; }
-    buf[read_len] = '\0';
-
-    cJSON *root = cJSON_Parse(buf);
-    free(buf);
-    if (!root) return ESP_FAIL;
-
-    esp_err_t result = ESP_FAIL;
-    if (cJSON_IsArray(root) && cJSON_GetArraySize(root) > 0) {
-        cJSON *item    = cJSON_GetArrayItem(root, 0);
-        cJSON *url_obj = cJSON_GetObjectItemCaseSensitive(item, "ota_url");
-        if (cJSON_IsString(url_obj) && url_obj->valuestring) {
-            strncpy(out_url, url_obj->valuestring, max_len - 1);
-            out_url[max_len - 1] = '\0';
-            result = ESP_OK;
-        }
-    }
-    cJSON_Delete(root);
-    return result;
+static uint32_t App_FrameCounter_Read(void)
+{
+    return App_BKP_Read32(BKP_REG_FRAME_COUNTER_LO, BKP_REG_FRAME_COUNTER_HI);
 }
 
-static void ota_task(void *pvParameters) {
-    vTaskDelay(pdMS_TO_TICKS(45000));
+static void App_FrameCounter_Write(uint32_t counter)
+{
+    App_BKP_Write32(BKP_REG_FRAME_COUNTER_LO, BKP_REG_FRAME_COUNTER_HI, counter);
+}
 
-    char dynamic_ota_url[512]  = {0};
-    char last_flashed_url[512] = {0};
+static uint32_t App_FrameCounter_Reserve(void)
+{
+    uint32_t counter = App_FrameCounter_Read();
 
-    while (1) {
-        if (s_wifi_connected) {
-            if (fetch_supabase_ota_url(dynamic_ota_url, sizeof(dynamic_ota_url)) == ESP_OK) {
-                bool is_old = false;
-                nvs_handle_t nvs_h;
-                if (nvs_open("ota_store", NVS_READWRITE, &nvs_h) == ESP_OK) {
-                    size_t sz = sizeof(last_flashed_url);
-                    if (nvs_get_str(nvs_h, "last_url", last_flashed_url, &sz) == ESP_OK)
-                        is_old = (strcmp(dynamic_ota_url, last_flashed_url) == 0);
-                    nvs_close(nvs_h);
-                }
+    /* Reserve before encryption to avoid nonce reuse after an unexpected reset. */
+    App_FrameCounter_Write(counter + 1U);
 
-                if (!is_old) {
-                    ESP_LOGW(TAG, "[OTA_ENGINE] 🚀 Firmware mới: %s", dynamic_ota_url);
+    return counter;
+}
 
-                    esp_http_client_config_t ota_http_cfg = {
-                        .url               = dynamic_ota_url,
-                        .timeout_ms        = HTTP_OTA_TIMEOUT_MS,
-                        .buffer_size       = 4096,
-                        .keep_alive_enable = true,
-                    };
-                    tls_cfg_fill(&ota_http_cfg);
+static uint16_t App_Heartbeat_Read(void)
+{
+    return (uint16_t)HAL_RTCEx_BKUPRead(&hrtc, BKP_REG_HEARTBEAT_COUNT);
+}
 
-                    const esp_https_ota_config_t ota_cfg = { .http_config = &ota_http_cfg };
+static void App_Heartbeat_Write(uint16_t count)
+{
+    HAL_RTCEx_BKUPWrite(&hrtc, BKP_REG_HEARTBEAT_COUNT, count);
+}
 
-                    if (esp_https_ota(&ota_cfg) == ESP_OK) {
-                        ESP_LOGI(TAG, "[OTA_ENGINE] ✅ Flash thành công. Khởi động lại...");
-                        if (nvs_open("ota_store", NVS_READWRITE, &nvs_h) == ESP_OK) {
-                            nvs_set_str(nvs_h, "last_url", dynamic_ota_url);
-                            nvs_commit(nvs_h);
-                            nvs_close(nvs_h);
-                        }
-                        vTaskDelay(pdMS_TO_TICKS(3000));
-                        esp_restart();
-                    } else {
-                        ESP_LOGE(TAG, "[OTA_ENGINE] ❌ Flash thất bại.");
-                    }
-                }
+/* RTC alarm helpers ---------------------------------------------------------*/
+
+static void App_RTC_Seconds_To_Time(uint32_t seconds_of_day, RTC_TimeTypeDef *time)
+{
+    seconds_of_day %= 86400U;
+
+    memset(time, 0, sizeof(*time));
+
+    time->Hours = (uint8_t)(seconds_of_day / 3600U);
+    seconds_of_day %= 3600U;
+    time->Minutes = (uint8_t)(seconds_of_day / 60U);
+    time->Seconds = (uint8_t)(seconds_of_day % 60U);
+}
+
+static uint8_t App_RTC_Get_Seconds_Of_Day(uint32_t *seconds_out)
+{
+    RTC_TimeTypeDef now_time = {0};
+    RTC_DateTypeDef now_date = {0};
+
+    if (seconds_out == NULL) {
+        return SENSOR_ERR;
+    }
+
+    if (HAL_RTC_GetTime(&hrtc, &now_time, RTC_FORMAT_BIN) != HAL_OK) {
+        return SENSOR_ERR;
+    }
+
+    /* STM32 HAL requires reading date after time to unlock shadow registers. */
+    if (HAL_RTC_GetDate(&hrtc, &now_date, RTC_FORMAT_BIN) != HAL_OK) {
+        return SENSOR_ERR;
+    }
+
+    *seconds_out =
+        ((uint32_t)now_time.Hours * 3600U) +
+        ((uint32_t)now_time.Minutes * 60U) +
+        ((uint32_t)now_time.Seconds);
+
+    return SENSOR_OK;
+}
+
+static uint8_t App_RTC_Schedule_Next_Alarm(uint32_t after_seconds)
+{
+    RTC_AlarmTypeDef alarm = {0};
+    RTC_TimeTypeDef alarm_time = {0};
+    uint32_t now_seconds = 0U;
+    uint32_t alarm_seconds = 0U;
+
+    if (after_seconds == 0U) {
+        after_seconds = 1U;
+    }
+
+    if (App_RTC_Get_Seconds_Of_Day(&now_seconds) != SENSOR_OK) {
+        sensor_debug_print("[RTC] Get time FAILED\r\n");
+        return SENSOR_ERR;
+    }
+
+    alarm_seconds = (now_seconds + after_seconds) % 86400U;
+    App_RTC_Seconds_To_Time(alarm_seconds, &alarm_time);
+
+    alarm.AlarmTime = alarm_time;
+    alarm.Alarm = RTC_ALARM_A;
+
+    (void)HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
+    __HAL_RTC_ALARM_CLEAR_FLAG(&hrtc, RTC_FLAG_ALRAF);
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+
+    if (HAL_RTC_SetAlarm_IT(&hrtc, &alarm, RTC_FORMAT_BIN) != HAL_OK) {
+        sensor_debug_print("[RTC] Set alarm FAILED\r\n");
+        return SENSOR_ERR;
+    }
+
+    sensor_debug_print(
+        "[RTC] Next alarm in %lu sec at %02u:%02u:%02u\r\n",
+        (unsigned long)after_seconds,
+        alarm_time.Hours,
+        alarm_time.Minutes,
+        alarm_time.Seconds
+    );
+
+    return SENSOR_OK;
+}
+
+/* With STANDBY, RTC alarm wake restarts main(). */
+void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *hrtc_cb)
+{
+    (void)hrtc_cb;
+}
+
+/* Power helpers -------------------------------------------------------------*/
+
+static uint8_t App_Was_Standby_Wakeup(void)
+{
+    uint8_t was_standby = 0U;
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+
+    if (__HAL_PWR_GET_FLAG(PWR_FLAG_SB) != RESET) {
+        was_standby = 1U;
+    }
+
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_SB);
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+
+    return was_standby;
+}
+
+static void App_Enter_Standby(void)
+{
+    sensor_debug_print("[PWR] Enter STANDBY\r\n");
+
+    /* Put E32 into Sleep/Config mode before MCU standby. */
+    sensor_lora_sleep();
+
+    /* Let UART1 finish debug logs. */
+    HAL_Delay(100);
+
+    HAL_IWDG_Refresh(&hiwdg);
+
+    App_Backup_Enable();
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+
+    HAL_PWR_EnterSTANDBYMode();
+
+    Error_Handler();
+}
+
+/* LoRa config once at cold boot --------------------------------------------*/
+
+static void App_LoRa_Config_Check_Once(void)
+{
+    uint8_t lora_cfg[6];
+
+    sensor_debug_print("[SYS] Cold boot E32 config check\r\n");
+
+    if (sensor_lora_read_config(lora_cfg) == SENSOR_OK) {
+        debug_dump_hex("[LORA_CFG]", lora_cfg, sizeof(lora_cfg));
+
+        if (!lora_cfg_is_target(lora_cfg)) {
+            sensor_debug_print("[SYS] E32 config mismatch, writing target config\r\n");
+
+            if (sensor_lora_write_default_config() != SENSOR_OK) {
+                sensor_debug_print("[SYS] E32 config write FAILED\r\n");
+            } else {
+                sensor_debug_print("[SYS] E32 config write OK\r\n");
             }
+        } else {
+            sensor_debug_print("[SYS] E32 config already OK\r\n");
         }
-        vTaskDelay(pdMS_TO_TICKS(30UL * 60UL * 1000UL));
-    }
-}
+    } else {
+        sensor_debug_print("[SYS] E32 config read FAILED, try write once\r\n");
 
-/* ═══════════════════════════════════════════════════════════════════
- * WiFi STA — multi-AP fallback
- * ═══════════════════════════════════════════════════════════════════ */
-static void wifi_retry_timer_cb(TimerHandle_t xTimer) { esp_wifi_connect(); }
-
-static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        s_wifi_connected = false;
-        s_wifi_idx = (s_wifi_idx + 1) % NUM_WIFIS;
-        ESP_LOGW(TAG, "[WIFI] Thử mạng: %s", s_wifi_list[s_wifi_idx].ssid);
-        wifi_config_t wcfg = {0};
-        strncpy((char *)wcfg.sta.ssid,     s_wifi_list[s_wifi_idx].ssid, sizeof(wcfg.sta.ssid)     - 1);
-        strncpy((char *)wcfg.sta.password, s_wifi_list[s_wifi_idx].pass, sizeof(wcfg.sta.password) - 1);
-        esp_wifi_set_config(WIFI_IF_STA, &wcfg);
-        xTimerStart(s_wifi_timer, 0);
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        s_wifi_connected = true;
-        xTimerStop(s_wifi_timer, 0);
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        ESP_LOGI(TAG, "[WIFI] ✅ IP cấp phát OK.");
-    }
-}
-
-static void wifi_init_sta(void) {
-    s_wifi_event_group = xEventGroupCreate();
-    s_wifi_timer = xTimerCreate("wifi_retry", pdMS_TO_TICKS(5000), pdFALSE, NULL, wifi_retry_timer_cb);
-    nvs_flash_init();
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,    &wifi_event_handler, NULL, NULL);
-    esp_event_handler_instance_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
-    wifi_config_t wcfg = {0};
-    strncpy((char *)wcfg.sta.ssid,     s_wifi_list[0].ssid, sizeof(wcfg.sta.ssid)     - 1);
-    strncpy((char *)wcfg.sta.password, s_wifi_list[0].pass, sizeof(wcfg.sta.password) - 1);
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
-    esp_wifi_start();
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * ASCON / SENSOR DECODE
- * ═══════════════════════════════════════════════════════════════════ */
-static int16_t  read_i16_le(const uint8_t *p) { return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
-static uint16_t read_u16_le(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
-
-static void build_nonce_from_counter(uint32_t c, uint8_t n[16]) {
-    memset(n, 0, 16);
-    n[0] = (uint8_t)(c >> 24); n[1] = (uint8_t)(c >> 16);
-    n[2] = (uint8_t)(c >>  8); n[3] = (uint8_t)(c);
-    n[4] = 0x57U; n[5] = 0x53U; n[6] = 0x4EU; n[7] = 0x31U;
-}
-
-static bool sensor_payload_decode(const uint8_t pt[SENSOR_PLAINTEXT_LEN],
-                                  uint32_t counter, SensorDecodedData_t *out) {
-    memset(out, 0, sizeof(*out));
-    SensorPayloadRaw_t raw;
-    raw.env_temp_raw   = read_i16_le(&pt[0]);
-    raw.env_hum_raw    = read_u16_le(&pt[2]);
-    raw.air_press_raw  = read_u16_le(&pt[4]);
-    raw.board_temp_raw = read_i16_le(&pt[6]);               
-    raw.batt_volt_raw  = pt[8];
-    raw.health_flag    = pt[9];
-
-    out->frame_counter = counter;             
-    out->health_flag   = raw.health_flag;             
-    out->sht30_ok      = ((raw.health_flag & ERR_SHT30)  == 0);
-    out->bmp388_ok     = ((raw.health_flag & ERR_BMP388) == 0);
-    out->payload_ok    = out->sht30_ok && out->bmp388_ok;
-    out->ina219_ok     = ((raw.health_flag & ERR_VBAT)   == 0);
-    out->board_temp_c  = ((float)raw.board_temp_raw) / 100.0f;   
-    out->battery_volt  = battery_raw_to_volt(pt[8]);
-    
-    if (out->sht30_ok) {
-        out->env_temp_c       = (float)raw.env_temp_raw  / 100.0f;
-        out->env_humidity_pct = (float)raw.env_hum_raw   / 100.0f;
-    }
-    if (out->bmp388_ok) {
-        out->air_pressure_hpa = 900.0f + (float)raw.air_press_raw / 100.0f;
-    }
-    if (out->ina219_ok) {
-        out->battery_volt = battery_raw_to_volt(pt[8]);
-    }
-
-    return true;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * FRAME PROCESSING
- * ═══════════════════════════════════════════════════════════════════ */
-static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
-    uint32_t counter =  (uint32_t)frame[0]
-                     | ((uint32_t)frame[1] <<  8)
-                     | ((uint32_t)frame[2] << 16)
-                     | ((uint32_t)frame[3] << 24);
-
-    ESP_LOGI(TAG, "[LORA_RX] Counter=%"PRIu32" — ASCON-128a...", counter);
-
-    uint8_t nonce[16];
-    build_nonce_from_counter(counter, nonce);
-
-    uint8_t ascon_input[ASCON_INPUT_LEN];
-    memcpy(&ascon_input[0], &frame[4],  10);
-    memcpy(&ascon_input[10], &frame[14], 4);
-
-    uint8_t plaintext[SENSOR_PLAINTEXT_LEN] = {0};
-    unsigned long long mlen = 0ULL;
-
-    if (crypto_aead_decrypt_tag4(plaintext, &mlen, NULL,
-                                 ascon_input, sizeof(ascon_input),
-                                 NULL, 0, nonce, ASCON_SECRET_KEY) != 0) {
-        ESP_LOGE(TAG, "[LORA_RX] ❌ ASCON tag lỗi!"); return;
-    }
-
-    SensorDecodedData_t decoded;
-    if (!sensor_payload_decode(plaintext, counter, &decoded)) return;
-
-    if (decoded.payload_ok) {
-        ESP_LOGI(TAG, "[LORA_RX] ✅ T=%.2f°C H=%.2f%% P=%.2fhPa",
-                 decoded.env_temp_c, decoded.env_humidity_pct,
-                 decoded.air_pressure_hpa);
-
-        AI_DataPoint_t dp = {
-            .pressure = decoded.air_pressure_hpa,
-            .humidity = decoded.env_humidity_pct,
-            .temperature = decoded.env_temp_c
-        };
-        xQueueSend(s_ai_data_queue, &dp, 0);
-    }
-    
-    if (xQueueSend(s_supabase_queue, &decoded, pdMS_TO_TICKS(10)) != pdPASS) {
-        ESP_LOGW(TAG, "[LORA_RX] ⚠ Mạng chậm, Queue Supabase đầy.");
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * RECEIVER LOOP
- * ═══════════════════════════════════════════════════════════════════ */
-static void receiver_loop(void) {
-    uint8_t rx[64], frame[E32_FRAME_LEN];
-    size_t  frame_pos = 0; int64_t last_byte_time = 0;
-    while (1) {
-        int rd = uart_read_bytes(E32_UART_NUM, rx, sizeof(rx), pdMS_TO_TICKS(50));
-        int64_t t_now = now_ms();
-        if (rd <= 0) {
-            if (frame_pos > 0 && (t_now - last_byte_time) > 1000) frame_pos = 0;
-            continue;
-        }
-        for (int i = 0; i < rd; ++i) {
-            int64_t b = now_ms();
-            if (frame_pos > 0 && (b - last_byte_time) > E32_FRAME_IDLE_MS) frame_pos = 0;
-            frame[frame_pos++] = rx[i];
-            last_byte_time = b;
-            if (frame_pos == E32_FRAME_LEN) { process_frame(frame); frame_pos = 0; }
+        if (sensor_lora_write_default_config() != SENSOR_OK) {
+            sensor_debug_print("[SYS] E32 config write FAILED\r\n");
         }
     }
+
+    /* Keep radio asleep after cold-boot config. */
+    sensor_lora_sleep();
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * E32 LORA INIT
- * ═══════════════════════════════════════════════════════════════════ */
-static void lora_e32_init_config(void) {
-    gpio_set_level(E32_M0_PIN, 1); gpio_set_level(E32_M1_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    uint8_t cfg[6] = { E32_CMD_WRITE_FLASH, E32_CFG_ADDH, E32_CFG_ADDL,
-                       E32_CFG_SPEED, E32_CFG_CHAN, E32_CFG_OPTION };
-    uart_write_bytes(E32_UART_NUM, cfg, sizeof(cfg));
-    uart_wait_tx_done(E32_UART_NUM, pdMS_TO_TICKS(100));
-    vTaskDelay(pdMS_TO_TICKS(100));
-    gpio_set_level(E32_M0_PIN, 0); gpio_set_level(E32_M1_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-}
+/* App cycle -----------------------------------------------------------------*/
 
-/* ═══════════════════════════════════════════════════════════════════
- * app_main
- * ═══════════════════════════════════════════════════════════════════ */
-void app_main(void) {
-    ESP_LOGI(TAG, "================================================");
-    ESP_LOGI(TAG, "  TRẠM QUAN TRẮC MLR NOWCASTING (2H FORECAST)  ");
-    ESP_LOGI(TAG, "================================================");
+static void App_Run_One_Cycle(void)
+{
+    uint8_t init_status;
+    uint8_t tx_ok;
+    SensorData_t payload;
+    LoRaTxFrame_t tx_frame;
+    uint32_t tx_counter32;
 
-    gpio_set_direction(E32_M0_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_direction(E32_M1_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(E32_M0_PIN, 0); gpio_set_level(E32_M1_PIN, 0);
 
-    uart_driver_install(E32_UART_NUM, 2048, 512, 0, NULL, 0);
-    uart_config_t uc = {
-        .baud_rate  = 115200, .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
-    };
-    uart_param_config(E32_UART_NUM, &uc);
-    uart_set_pin(E32_UART_NUM, E32_UART_TX_PIN, E32_UART_RX_PIN, -1, -1);
+    memset(&payload, 0, sizeof(payload));
+    memset(&tx_frame, 0, sizeof(tx_frame));
 
-    lora_e32_init_config();
-    wifi_init_sta();
+    HAL_IWDG_Refresh(&hiwdg);
 
-    /* ── Chờ WiFi kết nối TRƯỚC khi khởi động NTP ────────────────────── */
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
+    sensor_debug_print("\r\n[SYS] ===== APP CYCLE START =====\r\n");
 
-    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_setservername(1, "time.cloudflare.com");
-    esp_sntp_init();
+    App_Delay_With_Watchdog(SENSOR_POWER_SETTLE_MS);
 
-    int retry = 0;
-    const int retry_count = 20; 
-    time_t now = 0;
-    struct tm timeinfo = { 0 };
-    
-    while (timeinfo.tm_year < (2023 - 1900) && ++retry < retry_count) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        time(&now);
-        localtime_r(&now, &timeinfo);
+    init_status = Sensors_Init_Hardware();
+    sensor_debug_print("[SENSORS] Init status = 0x%02X\r\n", init_status);
+
+    HAL_IWDG_Refresh(&hiwdg);
+
+    Sensors_Trigger_All();
+    App_Delay_With_Watchdog(SENSOR_MEASURE_WAIT_MS);
+
+    Sensors_Collect_And_Pack(&payload);
+    debug_dump_hex("[PAYLOAD]", (const uint8_t *)&payload, sizeof(payload));
+
+    /* Backup counter is 32-bit; radio frame is 18 bytes: counter4 + ciphertext10 + tag4. */
+    tx_counter32 = App_FrameCounter_Reserve();
+   // tx_counter16 = (uint16_t)(tx_counter32 & 0xFFFFU);
+    g_frame_counter = tx_counter32;
+
+    if (Edge_Crypto_Pack(&payload,tx_counter32,  &tx_frame) != SENSOR_OK) {
+        sensor_debug_print("[SYS] Skip LoRa TX because crypto failed\r\n");
+        sensor_lora_sleep();
+        return;
     }
 
-    if (timeinfo.tm_year >= (2023 - 1900)) {
-        setenv("TZ", "UTC-7", 1);
-        tzset();
+    debug_dump_hex("[FRAME]", (const uint8_t *)&tx_frame, sizeof(tx_frame));
+
+    /* Do not read/write E32 config here. Keep TX timing clean. */
+    tx_ok = sensor_lora_transmit((const uint8_t *)&tx_frame, sizeof(tx_frame));
+    if (tx_ok != SENSOR_OK) {
+        sensor_debug_print(
+            "[SYS] LoRa TX FAILED for frame32=%lu\r\n",
+            (unsigned long)tx_counter32
+        );
+        sensor_lora_sleep();
+        return;
     }
-    
-    /* KHỞI TẠO QUEUES VÀ TASKS */
-    s_ai_data_queue = xQueueCreate(10, sizeof(AI_DataPoint_t));
-    s_supabase_queue = xQueueCreate(10, sizeof(SensorDecodedData_t));
 
-    xTaskCreatePinnedToCore(ai_task,  "AI_TASK",  8192, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(ota_task, "OTA_TASK", 8192, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(supabase_task, "SBASE_TASK", 8192, NULL, 4, NULL, 0);
+    sensor_debug_print(
+        "[SYS] TX done v2 for frame32=%lu len=%u\r\n",
+        (unsigned long)tx_counter32,
 
-    vTaskPrioritySet(NULL, 10); 
-    receiver_loop();
+        (unsigned)sizeof(tx_frame)
+    );
+
+    /* Extra margin before sleeping E32. */
+    HAL_Delay(120);
+    sensor_lora_sleep();
+
+    HAL_IWDG_Refresh(&hiwdg);
+
+    sensor_debug_print("[SYS] ===== APP CYCLE END =====\r\n");
 }
+
+static void Error_Handler_Print_And_Stop(const char *msg)
+{
+    if (msg != NULL) {
+        sensor_debug_print("[ERR] %s\r\n", msg);
+    }
+    Error_Handler();
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  // (Giả sử I2C1 dùng PB6(SCL) và PB7(SDA))
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    I2C_Recover_Bus(GPIOB, GPIO_PIN_6, GPIOB, GPIO_PIN_7);
+
+    //(Nếu có I2C2 dùng PB10/PB11, gọi thêm 1 lần nữa cho I2C2)
+     I2C_Recover_Bus(GPIOB, GPIO_PIN_10, GPIOB, GPIO_PIN_11);
+  MX_I2C1_Init();
+  MX_I2C2_Init();
+  MX_IWDG_Init();
+  MX_USART2_UART_Init();
+  MX_USART1_UART_Init();
+  MX_RTC_Init();
+  /* USER CODE BEGIN 2 */
+
+  uint8_t woke_from_standby;
+    uint16_t heartbeat_count;
+
+    App_Backup_Init_If_Needed();
+
+    woke_from_standby = App_Was_Standby_Wakeup();
+
+    g_frame_counter = App_FrameCounter_Read();
+    heartbeat_count = App_Heartbeat_Read();
+
+    sensor_debug_print(
+        "\r\n[BOOT] standby=%u frame=%lu heartbeat=%u\r\n",
+        woke_from_standby,
+        (unsigned long)g_frame_counter,
+        heartbeat_count
+    );
+
+    /* Only check/configure E32 on cold boot, not right before every TX. */
+    if (woke_from_standby == 0U) {
+        heartbeat_count = 0U;
+        App_Heartbeat_Write(heartbeat_count);
+        App_LoRa_Config_Check_Once();
+    } else {
+        heartbeat_count++;
+        App_Heartbeat_Write(heartbeat_count);
+    }
+
+    if (heartbeat_count < APP_TX_HEARTBEATS) {
+        sensor_debug_print(
+            "[RTC] Heartbeat %u/%u, no TX\r\n",
+            heartbeat_count,
+            (unsigned)APP_TX_HEARTBEATS
+        );
+
+        if (App_RTC_Schedule_Next_Alarm(APP_RTC_HEARTBEAT_SEC) != SENSOR_OK) {
+            Error_Handler_Print_And_Stop("RTC heartbeat schedule FAILED");
+        }
+
+        App_Enter_Standby();
+    }
+
+    /* TX is due. */
+    App_Heartbeat_Write(0U);
+
+    sensor_debug_print("[RTC] TX due\r\n");
+    sensor_debug_print("[SYS] Skip E32 config check before TX\r\n");
+
+    /* Give E32 a little pre-TX normal-mode margin. */
+    sensor_lora_normal();
+    HAL_Delay(200);
+
+    App_Run_One_Cycle();
+
+    if (App_RTC_Schedule_Next_Alarm(APP_RTC_HEARTBEAT_SEC) != SENSOR_OK) {
+        Error_Handler_Print_And_Stop("RTC heartbeat schedule after TX FAILED");
+    }
+
+    App_Enter_Standby();
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+	  Error_Handler();
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC;
+  PeriphClkInit.RTCClockSelection = RCC_RTCCLKSOURCE_LSI;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief I2C2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C2_Init(void)
+{
+
+  /* USER CODE BEGIN I2C2_Init 0 */
+
+  /* USER CODE END I2C2_Init 0 */
+
+  /* USER CODE BEGIN I2C2_Init 1 */
+
+  /* USER CODE END I2C2_Init 1 */
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.ClockSpeed = 100000;
+  hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C2_Init 2 */
+
+  /* USER CODE END I2C2_Init 2 */
+
+}
+
+/**
+  * @brief IWDG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG_Init 0 */
+
+  /* USER CODE END IWDG_Init 0 */
+
+  /* USER CODE BEGIN IWDG_Init 1 */
+
+  /* USER CODE END IWDG_Init 1 */
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
+  hiwdg.Init.Reload = 3906;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG_Init 2 */
+
+  /* USER CODE END IWDG_Init 2 */
+
+}
+
+/**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef DateToUpdate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.AsynchPrediv = RTC_AUTO_1_SECOND;
+  hrtc.Init.OutPut = RTC_OUTPUTSOURCE_ALARM;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+  App_Backup_Enable();
+  if (HAL_RTCEx_BKUPRead(&hrtc, BKP_REG_MAGIC) != BKP_MAGIC_VALUE)
+  {
+      sTime.Hours = 0x0;
+      sTime.Minutes = 0x0;
+      sTime.Seconds = 0x0;
+
+      if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+      {
+          Error_Handler();
+      }
+
+      DateToUpdate.WeekDay = RTC_WEEKDAY_MONDAY;
+      DateToUpdate.Month = RTC_MONTH_JANUARY;
+      DateToUpdate.Date = 0x1;
+      DateToUpdate.Year = 0x0;
+
+      if (HAL_RTC_SetDate(&hrtc, &DateToUpdate, RTC_FORMAT_BCD) != HAL_OK)
+      {
+          Error_Handler();
+      }
+  }
+#if 0
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  DateToUpdate.WeekDay = RTC_WEEKDAY_MONDAY;
+  DateToUpdate.Month = RTC_MONTH_JANUARY;
+  DateToUpdate.Date = 0x1;
+  DateToUpdate.Year = 0x0;
+
+  if (HAL_RTC_SetDate(&hrtc, &DateToUpdate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+#endif
+  /* USER CODE END RTC_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, LORA_M0_Pin|LORA_M1_Pin|TPS_PS_SYNC_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : LORA_AUX_Pin */
+  GPIO_InitStruct.Pin = LORA_AUX_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(LORA_AUX_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : LORA_M0_Pin LORA_M1_Pin TPS_PS_SYNC_Pin */
+  GPIO_InitStruct.Pin = LORA_M0_Pin|LORA_M1_Pin|TPS_PS_SYNC_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

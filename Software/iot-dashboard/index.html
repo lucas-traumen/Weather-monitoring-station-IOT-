@@ -9,7 +9,6 @@
 </head>
 <body>
 
-  <!-- ══ SIDEBAR ══════════════════════════════════════════════ -->
   <aside class="sidebar">
     <div class="sidebar-logo">⚡</div>
     <div class="sidebar-brand">IoT<br>Sense</div>
@@ -27,7 +26,6 @@
 
     <div class="sidebar-bottom">
       <div class="sidebar-divider"></div>
-      <!-- Config: dùng :target để mở modal CSS-only -->
       <a href="#config-modal" class="sidebar-item" title="System Configuration">
         <span class="sidebar-icon">⚙</span>
         <span>Config</span>
@@ -35,7 +33,6 @@
     </div>
   </aside>
 
-  <!-- ══ CONFIG MODAL (CSS-only :target) ══════════════════════ -->
   <div class="config-overlay" id="config-modal">
     <div class="config-modal">
       <div class="config-modal-header">
@@ -73,12 +70,10 @@
       <div class="config-note">
         Để chuyển sang ESP32 thật: đổi <code style="color:var(--amber);font-size:.72rem">MODE = "REAL"</code>
         trong <code style="color:var(--amber);font-size:.72rem">config.js</code> và đóng tab simulator.
-        Web dashboard không cần thay đổi gì thêm.
       </div>
     </div>
   </div>
 
-  <!-- ══ MAIN ═════════════════════════════════════════════════ -->
   <div class="main-wrap">
 
     <header class="topbar">
@@ -97,7 +92,6 @@
 
     <div class="container">
 
-      <!-- ── Info chips ──────────────────────────────────────── -->
       <div class="info-row">
         <div class="info-chip">
           <span class="ic-label">Mode</span>
@@ -121,7 +115,6 @@
         </div>
       </div>
 
-      <!-- ── Telemetry status bar ─────────────────────────────── -->
       <div class="status-bar">
         <div class="status-bar-left">
           <span class="status-bar-icon">📡</span>
@@ -135,22 +128,18 @@
         </div>
       </div>
 
-      <!-- ── SECTION: Sensor Metrics ─────────────────────────── -->
       <div class="section-label">Môi trường thực tế — Sensor Metrics</div>
 
       <div class="dashboard-body">
 
-        <!-- ─── Hero card (Left) ──────────────────────────────── -->
         <div class="hero-card">
 
-          <!-- Top: Big temperature -->
           <div>
             <div class="hero-label">🌡 Temperature</div>
             <div class="hero-value" id="temperature">--<span class="unit">°C</span></div>
             <div class="hero-sub" id="tempSub">—</div>
           </div>
 
-          <!-- Mid: Fills the blank space with board metrics + status -->
           <div class="hero-mid">
             <div class="hero-status-line">
               <span class="hero-status-icon">📶</span>
@@ -172,7 +161,6 @@
             </div>
           </div>
 
-          <!-- Bottom: Mini stats row -->
           <div>
             <div class="hero-divider"></div>
             <div class="hero-bottom">
@@ -185,8 +173,8 @@
                 <span class="hero-stat-val" id="pressure-mini">-- hPa</span>
               </div>
               <div class="hero-stat">
-                <span class="hero-stat-label">📈 Trend</span>
-                <span class="hero-stat-val" id="trend-mini">--</span>
+                <span class="hero-stat-label">🔮 Pred (2h)</span>
+                <span class="hero-stat-val" id="pred-mini" style="color:var(--indigo-light)">-- °C</span>
               </div>
               <div class="hero-stat">
                 <span class="hero-stat-label">🕒 Updated</span>
@@ -195,12 +183,8 @@
             </div>
           </div>
 
-        </div><!-- /hero-card -->
+        </div><div class="highlight-panel">
 
-        <!-- ─── Right panel: 2×3 grid ─────────────────────────── -->
-        <div class="highlight-panel">
-
-          <!-- Row 1: Humidity | Pressure -->
           <div class="highlight-card" style="--hc-col:var(--col-hum)">
             <div class="hc-icon">💧</div>
             <div class="hc-body">
@@ -219,13 +203,12 @@
             </div>
           </div>
 
-          <!-- Row 2: Trend | Battery -->
-          <div class="highlight-card" style="--hc-col:var(--col-trend)">
-            <div class="hc-icon">📈</div>
+          <div class="highlight-card" style="--hc-col:var(--col-board)">
+            <div class="hc-icon">🎛️</div>
             <div class="hc-body">
-              <div class="hc-label">Pressure Trend</div>
-              <div class="hc-value" id="trend" style="font-size:1.05rem;text-transform:capitalize">--</div>
-              <div class="hc-sub" id="trendSub">—</div>
+              <div class="hc-label">Board Temp</div>
+              <div class="hc-value" id="board_temp">--<span class="unit">°C</span></div>
+              <div class="hc-sub" id="boardTempSub">Nhiệt độ bo mạch</div>
             </div>
           </div>
 
@@ -238,64 +221,19 @@
             </div>
           </div>
 
-          <!-- Row 3: Board Temp | AI Alert -->
-          <div class="highlight-card" style="--hc-col:var(--col-board)">
-            <div class="hc-icon">🎛️</div>
-            <div class="hc-body">
-              <div class="hc-label">Board Temp</div>
-              <div class="hc-value" id="board_temp">--<span class="unit">°C</span></div>
-              <div class="hc-sub" id="boardTempSub">Nhiệt độ phần cứng</div>
-            </div>
-          </div>
+        </div></div><div class="section-label">Edge AI Telemetry — Hồi quy tuyến tính đa biến (MLR)</div>
 
-          <div class="highlight-card mc-status" id="statusCard" style="--hc-col:var(--col-status)">
-            <div class="hc-icon">📡</div>
-            <div class="hc-body">
-              <div class="hc-label">AI Alert</div>
-              <div class="mc-value" id="warning" style="font-size:0.88rem;line-height:1.3">--</div>
-              <div class="hc-sub" id="statusSub">Monitoring active</div>
-            </div>
-          </div>
-
-        </div><!-- /highlight-panel -->
-
-      </div><!-- /dashboard-body -->
-
-      <!-- ── SECTION: Edge AI Telemetry ──────────────────────── -->
-      <div class="section-label">Edge AI Telemetry — Dự đoán toán học</div>
-
-      <div class="ai-grid">
-
-        <div class="ai-card" style="--ai-col:var(--col-pres)">
-          <div class="ai-label">
-            <span class="ai-icon">📐</span>
-            <span class="ai-label-text">β Pressure (Slope)</span>
-          </div>
-          <div class="ai-value" id="beta_pressure">--</div>
-          <div class="ai-sub">Độ dốc áp suất khí quyển / 10 phút</div>
-        </div>
-
-        <div class="ai-card" style="--ai-col:var(--col-hum)">
-          <div class="ai-label">
-            <span class="ai-icon">📐</span>
-            <span class="ai-label-text">β Humidity (Slope)</span>
-          </div>
-          <div class="ai-value" id="beta_humidity">--</div>
-          <div class="ai-sub">Độ dốc ẩm độ tương đối / 10 phút</div>
-        </div>
-
-        <div class="ai-card" style="--ai-col:var(--col-temp)">
-          <div class="ai-label">
+      <div class="ai-grid" style="grid-template-columns: 1fr;">
+        <div class="ai-card" style="--ai-col:var(--indigo-light); max-width: 500px; margin: 0 auto; text-align: center;">
+          <div class="ai-label" style="justify-content: center;">
             <span class="ai-icon">🔮</span>
-            <span class="ai-label-text">Predicted Temp (1h)</span>
+            <span class="ai-label-text">Dự báo Nhiệt độ (2 giờ tới)</span>
           </div>
-          <div class="ai-value cyan" id="predicted_temp">--<span class="unit">°C</span></div>
-          <div class="ai-sub" id="predictedSub">Tiên lượng nhiệt độ bằng mô hình SLR</div>
+          <div class="ai-value cyan" id="predicted_temp_2h">--<span class="unit">°C</span></div>
+          <div class="ai-sub" id="predictedSub">Suy luận tức thời dựa trên thuật toán MLR tại vi điều khiển</div>
         </div>
-
       </div>
 
-      <!-- ── SECTION: MLOps OTA ──────────────────────────────── -->
       <div class="section-label">MLOps Control — OTA Remote Deployment</div>
 
       <div class="ota-panel">
@@ -315,16 +253,12 @@
         <div class="ota-log" id="otaStatusLog">Trạng thái: Sẵn sàng nhận file .bin</div>
       </div>
 
-      <!-- Footer -->
       <div class="page-footer">
         <span>Updated: <span id="updated-footer">--</span></span>
-        <span>IoTSenseHub v3.0 · MLOps Pipeline</span>
+        <span>IoTSenseHub v3.5 · MLOps MLR Pipeline</span>
       </div>
 
-    </div><!-- /container -->
-  </div><!-- /main-wrap -->
-
-  <script src="config.js"></script>
+    </div></div><script src="config.js"></script>
   <script src="supabase.js"></script>
   <script src="app.js"></script>
 
@@ -363,9 +297,10 @@
     setInterval(updateCount, 10000);
 
     // ── MutationObservers for flash + side effects ─────────────
+    // Đã xóa các ID cũ như 'warning', 'beta_pressure', 'trend'
     const flashIds = [
-      'temperature', 'humidity', 'pressure', 'battery', 'trend',
-      'warning', 'beta_pressure', 'beta_humidity', 'predicted_temp', 'board_temp'
+      'temperature', 'humidity', 'pressure', 'battery', 
+      'predicted_temp_2h', 'board_temp'
     ];
 
     flashIds.forEach(id => {
@@ -389,6 +324,10 @@
         }
         if (id === 'battery') {
           const dst = document.getElementById('hero-battery');
+          if (dst) dst.textContent = el.textContent;
+        }
+        if (id === 'predicted_temp_2h') {
+          const dst = document.getElementById('pred-mini');
           if (dst) dst.textContent = el.textContent;
         }
 
@@ -422,22 +361,6 @@
           const m = document.getElementById('pressure-mini');
           if (m) m.textContent = el.textContent;
         }
-        if (id === 'trend') {
-          const m = document.getElementById('trend-mini');
-          if (m) m.textContent = el.textContent;
-        }
-
-        // ── Storm / frost card styling ─────────────────────────
-        if (id === 'warning') {
-          const txt  = el.textContent;
-          const card = document.getElementById('statusCard');
-          if (card) {
-            // Preserve highlight-card class, add state classes
-            card.className = 'highlight-card mc-status';
-            if (txt.includes('DÔNG') || txt.includes('⚠'))  card.classList.add('storm');
-            else if (txt.includes('SƯƠNG') || txt.includes('❄')) card.classList.add('frost');
-          }
-        }
 
         // ── Battery low state ──────────────────────────────────
         if (id === 'battery') {
@@ -464,11 +387,13 @@
         }
       }).observe(stSrc, { childList: true, characterData: true, subtree: true });
     }
-      setInterval(() => {
-        const records = document.getElementById('recordsChip')?.textContent || '--';
-        const packet = document.getElementById('packetCounter');
-        if(packet) packet.textContent = records;
-      }, 1000);
+    
+    // Gán đồng bộ bộ đếm frame_counter vào packetCounter nếu có
+    setInterval(() => {
+      const records = document.getElementById('recordsChip')?.textContent || '--';
+      const packet = document.getElementById('packetCounter');
+      if(packet) packet.textContent = records;
+    }, 1000);
   </script>
 
 </body>
