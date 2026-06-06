@@ -63,13 +63,14 @@
         </div>
         <div class="config-row">
           <span class="cr-key">FIRMWARE OTA</span>
-          <span class="cr-val">Supabase Storage · bucket: firmware</span>
+          <span class="cr-val">Edge Function v1.3 · DB plaintext · bucket: firmware</span>
         </div>
       </div>
 
       <div class="config-note">
-        Để chuyển sang ESP32 thật: đổi <code style="color:var(--amber);font-size:.72rem">MODE = "REAL"</code>
-        trong <code style="color:var(--amber);font-size:.72rem">config.js</code> và đóng tab simulator.
+        Pipeline hiện tại: <code style="color:var(--amber);font-size:.72rem">ESP32 GW v3.7.x</code>
+        → <code style="color:var(--amber);font-size:.72rem">Edge Function v1.3</code>
+        → <code style="color:var(--amber);font-size:.72rem">weather_logs plaintext</code>.
       </div>
     </div>
   </div>
@@ -79,7 +80,7 @@
     <header class="topbar">
       <div class="topbar-left">
         <div class="topbar-title">Sensor Monitor &amp; MLOps Engine</div>
-        <div class="topbar-sub">Real-time Environmental Data · Edge AI Operations</div>
+        <div class="topbar-sub">ESP32 → Edge Function → Plaintext DB · Supabase Realtime</div>
       </div>
       <div class="topbar-right">
         <div class="conn-pill">
@@ -255,7 +256,7 @@
 
       <div class="page-footer">
         <span>Updated: <span id="updated-footer">--</span></span>
-        <span>IoTSenseHub v3.5 · MLOps MLR Pipeline</span>
+        <span>IoTSenseHub Web v4.1 · Edge Function plaintext pipeline</span>
       </div>
 
     </div></div><script src="config.js"></script>

@@ -1,51 +1,65 @@
 /**
  * @file      app.js
- * @brief     Luồng điều khiển chính và đồng bộ giao diện Web Dashboard (Realtime)
- * @details   Kết nối cơ sở dữ liệu để cập nhật UI tức thời, quản lý watchdog tín hiệu và 
- * triển khai hệ thống nạp firmware từ xa (OTA Update Pipeline).
+ * @version   WEB_VERSION 4.1
+ * @brief     Dashboard controller — plaintext DB synchronized with Edge Function pipeline
+ *
+ * New architecture:
+ *   STM32 -> LoRa ASCON key1 -> ESP32 -> ASCON key2 HTTPS -> Edge Function
+ *   Edge Function decrypts key2 and inserts plaintext into public.weather_logs.
+ *   Web reads plaintext rows and subscribes to Supabase Realtime.
  */
 
 let prevData = null;
+let realtimeChannel = null;
 
-/**
- * @brief Tính toán xu hướng thay đổi giữa gói tin hiện tại và gói tin trước đó
- * @param cur Giá trị hiện tại
- * @param prev Giá trị trước đó
- * @param unit Đơn vị đo đi kèm
- */
-function calculateDelta(cur, prev, unit = '') {
-  if (prev == null) return '— Ổn định';
+const fmt = {
+  temp: (v) => v == null ? "--" : Number(v).toFixed(1),
+  hum:  (v) => v == null ? "--" : Number(v).toFixed(1),
+  pres: (v) => v == null ? "--" : Number(v).toFixed(0),
+  volt: (v) => v == null ? "--" : Number(v).toFixed(2),
+  id:   (v) => v ?? "--"
+};
+
+function setText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
+function setHTML(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = value;
+}
+
+function setConnStatus(label, isLive) {
+  setText("connLabel", label);
+  const dot = document.getElementById("connDot");
+  if (dot) dot.classList.toggle("live", !!isLive);
+}
+
+function calculateDelta(cur, prev, unit = "") {
+  if (cur == null || prev == null) return "— Chưa đủ dữ liệu";
   const diff = cur - prev;
-  if (Math.abs(diff) < 0.05) return '→ Không biến động';
+  if (Math.abs(diff) < 0.05) return "→ Không biến động";
   return diff > 0
     ? `▲ Tăng +${Math.abs(diff).toFixed(1)}${unit}`
     : `▼ Giảm −${Math.abs(diff).toFixed(1)}${unit}`;
 }
 
-/**
- * @brief Cập nhật nhanh nội dung text của một thẻ HTML
- */
-function setSubText(id, txt) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = txt;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * 1. GIÁM SÁT TÍN HIỆU HEARTBEAT (WATCHDOG MONITOR)
- * ═══════════════════════════════════════════════════════════════════ */
 function updateGatewayStatusUI(latestData) {
-  const statusText = document.getElementById('sensor-status-text');
-  const heroInlineStatus = document.getElementById('hero-status-inline');
+  const statusText = document.getElementById("sensor-status-text");
+  const heroInlineStatus = document.getElementById("hero-status-inline");
   if (!statusText || !heroInlineStatus) return;
 
   if (!latestData || !latestData.created_at) {
     statusText.innerHTML = "⚫ CHƯA CÓ DỮ LIỆU";
     statusText.style.color = "var(--text-2)";
     heroInlineStatus.innerHTML = "OFFLINE";
+    heroInlineStatus.style.background = "rgba(248,113,113,0.1)";
+    heroInlineStatus.style.color = "var(--text-2)";
+    setConnStatus("NO DATA", false);
     return;
   }
 
-  // Tính khoảng cách thời gian (phút) kể từ lần cuối nhận dữ liệu
   const diffMinutes = (Date.now() - new Date(latestData.created_at).getTime()) / 60000;
 
   if (diffMinutes > 5) {
@@ -54,165 +68,211 @@ function updateGatewayStatusUI(latestData) {
     heroInlineStatus.innerHTML = "DISCONNECTED";
     heroInlineStatus.style.background = "rgba(239,68,68,0.1)";
     heroInlineStatus.style.color = "var(--red)";
+    setConnStatus("STALE", false);
   } else {
     statusText.innerHTML = "🟢 HỆ THỐNG HOẠT ĐỘNG ỔN ĐỊNH";
     statusText.style.color = "var(--green)";
     heroInlineStatus.innerHTML = "ONLINE";
     heroInlineStatus.style.background = "rgba(16,185,129,0.1)";
     heroInlineStatus.style.color = "var(--green)";
+    setConnStatus("LIVE", true);
   }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * 2. CẬP NHẬT GIAO DIỆN (UI DATA RENDERER)
- * ═══════════════════════════════════════════════════════════════════ */
 function updateUI(data) {
   if (!data) return;
 
-  // Cập nhật các thông số cảm biến cơ bản
-  const fields = ['temperature', 'humidity', 'pressure', 'predicted_temp_2h', 'device_id'];
-  fields.forEach(f => {
-    const el = document.getElementById(f);
-    if (el) {
-      if (typeof data[f] === 'number') {
-        el.textContent = f === 'pressure' ? data[f].toFixed(0) : data[f].toFixed(1);
-      } else {
-        el.textContent = data[f] ?? '--';
-      }
-    }
-  });
+  // Main metrics
+  setText("temperature", fmt.temp(data.temperature));
+  setText("humidity", fmt.hum(data.humidity));
+  setText("pressure", fmt.pres(data.pressure));
+  setText("board_temp", fmt.temp(data.board_temp));
+  setText("battery", fmt.volt(data.battery));
+  setText("predicted_temp_2h", fmt.temp(data.predicted_temp_2h));
 
-  // Cập nhật thông số PIN từ INA219
-  const batEl = document.getElementById('battery');
-  if (batEl) {
-    batEl.textContent = data.battery != null ? parseFloat(data.battery).toFixed(2) : '--';
+  // Hero mini metrics
+  setText("humidity-mini", data.humidity == null ? "-- %" : `${fmt.hum(data.humidity)} %`);
+  setText("pressure-mini", data.pressure == null ? "-- hPa" : `${fmt.pres(data.pressure)} hPa`);
+  setText("pred-mini", data.predicted_temp_2h == null ? "-- °C" : `${fmt.temp(data.predicted_temp_2h)} °C`);
+  setText("hero-boardtemp", data.board_temp == null ? "-- °C" : `${fmt.temp(data.board_temp)} °C`);
+  setText("hero-battery", data.battery == null ? "-- V" : `${fmt.volt(data.battery)} V`);
+
+  // Device and counters
+  const device = data.device_id ?? CONFIG.DEVICE_ID;
+  setText("deviceChip", device);
+  setText("hero-device", device);
+  setText("deviceId", device);
+  setText("packetCounter", data.frame_counter != null ? `#${data.frame_counter}` : "--");
+
+  // Time
+  if (data.created_at) {
+    const t = new Date(data.created_at).toLocaleTimeString("vi-VN");
+    setText("updated", t);
+    setText("updated-footer", t);
+    setText("lastUpdateChip", t);
   }
 
-  const pktEl = document.getElementById('packetCounter');
-  if (pktEl) {
-    pktEl.textContent = data.frame_counter != null ? `#${data.frame_counter}` : '--';
-  }
-
-  const devEl = document.getElementById('deviceId');
-  if (devEl) {
-    devEl.textContent = data.device_id ?? 'N/A';
-  }
-
-  // Quản lý trạng thái Pin yếu trực quan
-  const batCard = document.getElementById('batCard');
+  // Battery state
+  const batCard = document.getElementById("batCard");
   if (batCard && data.battery != null) {
-    batCard.classList.toggle('low', data.battery < 3.6);
-    setSubText('batSub', data.battery >= 4.0 ? '🟢 Đầy Nguồn' : data.battery >= 3.6 ? '🟡 Tốt' : '🔴 Cạn Nguồn - Cần Sạc');
+    batCard.classList.toggle("low", data.battery < 3.6);
+    setText("batSub",
+      data.battery >= 4.0 ? "🟢 Đầy nguồn" :
+      data.battery >= 3.6 ? "🟡 Tốt" :
+      "🔴 Cạn nguồn - cần sạc"
+    );
   } else if (data.battery == null) {
-    setSubText('batSub', '❌ Lỗi cảm biến INA219');
+    setText("batSub", "— Không có dữ liệu pin");
   }
 
-  // Tính toán delta và kết xuất ra màn hình xu hướng thay đổi
+  // Trends
   if (prevData) {
-    setSubText('tempSub', calculateDelta(data.temperature, prevData.temperature, '°C'));
-    setSubText('humSub',  calculateDelta(data.humidity,    prevData.humidity, '%'));
-    setSubText('presSub', calculateDelta(data.pressure,    prevData.pressure, ' hPa'));
-    
-    // Xu hướng của mô hình AI dự báo
-    const aiDiff = data.predicted_temp_2h - data.temperature;
-    setSubText('predTempSub', `Dự báo nhiệt độ lệch đối lưu: ${aiDiff > 0 ? '+' : ''}${aiDiff.toFixed(1)}°C`);
+    setText("tempSub", calculateDelta(data.temperature, prevData.temperature, "°C"));
+    setText("humSub",  calculateDelta(data.humidity, prevData.humidity, "%"));
+    setText("presSub", calculateDelta(data.pressure, prevData.pressure, " hPa"));
+  } else {
+    setText("tempSub", "— Đang lấy mốc so sánh");
+    setText("humSub", "— Đang lấy mốc so sánh");
+    setText("presSub", "— Đang lấy mốc so sánh");
+  }
+
+  if (data.predicted_temp_2h != null && data.temperature != null) {
+    const diff = data.predicted_temp_2h - data.temperature;
+    setText("predictedSub",
+      `MLR tại gateway · dự báo lệch ${diff >= 0 ? "+" : ""}${diff.toFixed(1)}°C · Edge Function đã lưu DB plaintext`
+    );
+  } else {
+    setText("predictedSub", "MLR tại gateway · chờ dữ liệu dự báo");
   }
 
   updateGatewayStatusUI(data);
   prevData = data;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * 3. HỆ THỐNG ĐẨY FIRMWARE QUA MẠNG (OTA PIPELINE)
- * ═══════════════════════════════════════════════════════════════════ */
-async function handleOTAPipeline() {
-  const fileInput = document.getElementById('firmwareFile');
-  const logEl     = document.getElementById('otaLog');
+async function updateCount() {
+  try {
+    const count = await countWeatherLogs();
+    setText("recordsChip", count);
+  } catch (err) {
+    console.warn("[Dashboard] Không đếm được records:", err);
+    setText("recordsChip", "--");
+  }
+}
+
+async function fetchAndRenderLatest() {
+  try {
+    const latest = await fetchLatestWeather();
+    if (latest) updateUI(latest);
+    else updateGatewayStatusUI(null);
+  } catch (err) {
+    console.error("[Dashboard] Lỗi nạp bản ghi mới nhất:", err);
+    setHTML("sensor-status-text", "🔴 LỖI ĐỌC DATABASE");
+    setConnStatus("DB ERROR", false);
+  }
+}
+
+async function uploadAndDeployFirmware() {
+  const fileInput = document.getElementById("otaFileInput");
+  const logEl = document.getElementById("otaStatusLog");
   if (!fileInput || !logEl) return;
 
   const file = fileInput.files[0];
   if (!file) {
     logEl.textContent = "⚠ Vui lòng chọn file firmware dạng .bin trước!";
-    logEl.style.color = "var(--orange)";
+    logEl.style.color = "var(--amber)";
     return;
   }
 
   try {
-    logEl.innerHTML = "⏳ Đang tạo gói tin bảo mật và tải lên Cloud Storage...";
+    logEl.innerHTML = "⏳ Đang tải firmware lên Supabase Storage...";
     logEl.style.color = "var(--text-2)";
 
-    const fileName = `firmware_${Date.now()}.bin`;
-    const { data: uploadData, error: uploadError } = await supabaseClient
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const fileName = `firmware_${Date.now()}_${safeName}`;
+
+    const { error: uploadError } = await supabaseClient
       .storage
-      .from('ota-binaries')
-      .upload(fileName, file);
+      .from(CONFIG.STORAGE.FIRMWARE_BUCKET)
+      .upload(fileName, file, { upsert: true });
 
     if (uploadError) throw uploadError;
 
-    // Lấy Public URL của tệp nhị phân vừa tải lên
     const { data: { publicUrl } } = supabaseClient
       .storage
-      .from('ota-binaries')
+      .from(CONFIG.STORAGE.FIRMWARE_BUCKET)
       .getPublicUrl(fileName);
 
-    logEl.innerHTML = "⏳ Thực hiện cấu hình thiết bị ngầm (Upsert Config)...";
+    logEl.innerHTML = "⏳ Đang ghi lệnh OTA vào device_configs...";
 
-    // Ghi đè cấu hình lệnh OTA vào bảng device_configs để ESP32 kéo về
     const { error: dbError } = await supabaseClient
-      .from('device_configs')
-      .upsert([{ device_id: "ESP32_LORA_GW", ota_url: publicUrl, updated_at: new Date().toISOString() }]);
+      .from(CONFIG.API.CONFIG_TABLE)
+      .upsert([{
+        device_id: CONFIG.DEVICE_ID,
+        ota_url: publicUrl,
+        updated_at: new Date().toISOString()
+      }]);
 
     if (dbError) throw dbError;
 
-    logEl.innerHTML = `✅ <b>PHÁT LỆNH OTA THÀNH CÔNG!</b><br>` +
-      `• File nhị phân đã nằm an toàn trên Đám mây.<br>` +
-      `• Hệ thống đã phát tín hiệu hiệu năng cập nhật ngầm.<br>` +
-      `<span style="font-size:0.62rem;color:var(--text-2);">Đường dẫn: ${publicUrl}</span>`;
-    logEl.style.color = "var(--green)";
-    fileInput.value   = "";
+    logEl.innerHTML =
+      `✅ <b>PHÁT LỆNH OTA THÀNH CÔNG!</b><br>` +
+      `• Bucket: ${CONFIG.STORAGE.FIRMWARE_BUCKET}<br>` +
+      `• Device: ${CONFIG.DEVICE_ID}<br>` +
+      `<span style="font-size:0.62rem;color:var(--text-2);">URL: ${publicUrl}</span>`;
 
+    logEl.style.color = "var(--green)";
+    fileInput.value = "";
   } catch (err) {
-    console.error('[OTA Pipeline Error]:', err);
-    logEl.textContent = `❌ LỖI HỆ THỐNG PIPELINE: ${err.message}`;
+    console.error("[OTA Pipeline Error]:", err);
+    logEl.textContent = `❌ LỖI OTA PIPELINE: ${err.message}`;
     logEl.style.color = "var(--red)";
   }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * 4. KHỞI CHẠY HỆ THỐNG VÀ ĐĂNG KÝ REALTIME
- * ═══════════════════════════════════════════════════════════════════ */
-async function fetchLatestRecord() {
-  const { data, error } = await supabaseClient
-    .from(CONFIG.API.TABLE)
-    .select('*')
-    .order('created_at', { ascending: false })
-    .limit(1);
-  if (error) { console.error('[App] Lỗi nạp bản ghi gốc:', error); return null; }
-  return data?.[0] ?? null;
-}
-
 async function initDashboard() {
-  // Lấy cấu hình đưa lên Modal hiển thị
-  document.getElementById('cfgMode').textContent  = CONFIG.MODE;
-  document.getElementById('cfgTable').textContent = CONFIG.API.TABLE;
-  document.getElementById('cfgUrl').textContent   = CONFIG.SUPABASE_URL;
-  document.getElementById('cfgLimit').textContent = CONFIG.FETCH_LIMIT;
-  document.getElementById('cfgMode').className   = "badge " + CONFIG.MODE.toLowerCase();
+  // Config modal values
+  setText("cfgMode", CONFIG.MODE);
+  setText("cfgTable", CONFIG.API.TABLE);
+  setText("cfgUrl", CONFIG.SUPABASE_URL);
+  setText("cfgLimit", CONFIG.FETCH_LIMIT);
 
-  // Đọc dữ liệu mới nhất để render giao diện ngay lập tức khi load trang
-  const latest = await fetchLatestRecord();
-  if (latest) updateUI(latest);
+  const cfgMode = document.getElementById("cfgMode");
+  if (cfgMode) cfgMode.className = "cr-val " + (CONFIG.MODE === "DEMO" ? "mode-sim" : "mode-real");
 
-  // Đăng ký nhận sự kiện WebSocket từ Supabase Realtime Engine
-  subscribeRealtime((newRow) => {
-    console.log('[Realtime RX]:', newRow);
-    updateUI(newRow);
-  });
+  const modeChip = document.getElementById("modeChip");
+  if (modeChip) {
+    modeChip.textContent = CONFIG.MODE;
+    modeChip.className = "ic-val " + (CONFIG.MODE === "DEMO" ? "mode-sim" : "mode-real");
+  }
 
-  // Watchdog ngầm kiểm tra mất kết nối định kỳ mỗi 15 giây
+  setConnStatus("CONNECTING", false);
+
+  await fetchAndRenderLatest();
+  await updateCount();
+
+  realtimeChannel = subscribeRealtime(
+    async (newRow) => {
+      console.log("[Realtime RX]", newRow);
+      updateUI(newRow);
+      await updateCount();
+    },
+    (status) => {
+      if (status === "SUBSCRIBED") {
+        setConnStatus(prevData ? "LIVE" : "WAITING", !!prevData);
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        setConnStatus("WS ERROR", false);
+      } else if (status === "CLOSED") {
+        setConnStatus("CLOSED", false);
+      }
+    }
+  );
+
   setInterval(() => {
     if (prevData) updateGatewayStatusUI(prevData);
   }, 15000);
+
+  setInterval(updateCount, 10000);
 }
 
-document.addEventListener('DOMContentLoaded', initDashboard);
+window.uploadAndDeployFirmware = uploadAndDeployFirmware;
+document.addEventListener("DOMContentLoaded", initDashboard);

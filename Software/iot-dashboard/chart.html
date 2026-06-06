@@ -65,8 +65,9 @@
         </div>
       </div>
       <div class="config-note">
-        Để chuyển sang ESP32 thật: đổi <code style="color:var(--amber);font-size:.72rem">MODE = "REAL"</code>
-        trong <code style="color:var(--amber);font-size:.72rem">config.js</code>.
+        Pipeline hiện tại: <code style="color:var(--amber);font-size:.72rem">ESP32</code>
+        → <code style="color:var(--amber);font-size:.72rem">Edge Function</code>
+        → <code style="color:var(--amber);font-size:.72rem">DB plaintext</code>.
       </div>
     </div>
   </div>
@@ -77,7 +78,7 @@
     <header class="topbar">
       <div class="topbar-left">
         <div class="topbar-title">Data Analytics</div>
-        <div class="topbar-sub">Historical sensor data · Last <span id="pointCount">--</span> records · Auto-updates via Realtime</div>
+        <div class="topbar-sub">Plaintext DB history · Last <span id="pointCount">--</span> records · Auto-updates via Realtime</div>
       </div>
       <div class="topbar-right">
         <div class="conn-pill">
@@ -139,7 +140,7 @@
       </div>
 
       <div class="page-footer">
-        <span>IoTSenseHub v3.0 · Chart.js</span>
+        <span>IoTSenseHub Web v4.1 · Chart.js · Plaintext DB</span>
         <span>Showing <span id="shownCount">--</span> / <span id="totalCount">--</span> total records</span>
       </div>
 

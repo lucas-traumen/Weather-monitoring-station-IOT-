@@ -1,10 +1,10 @@
 /**
  * @file      main.c
  * @brief     Firmware cho Trạm Gateway (ESP32) - Hệ thống Quan trắc Khí tượng IoT
- * @details   Chịu trách nhiệm nhận dữ liệu LoRa, giải mã ASCON-128a, chạy mô hình AI 
- * (Hồi quy tuyến tính đa biến - MLR) dự báo nhiệt độ, và đẩy dữ liệu lên 
- * Supabase qua giao thức HTTPS. Có tích hợp OTA Update.
- * @version   3.5 (MLR Nowcasting)
+ * @details   Chịu trách nhiệm nhận dữ liệu LoRa, giải mã ASCON-128a key1 từ STM32,
+ * chạy mô hình AI MLR, mã hóa lại payload bằng ASCON key2 và POST lên
+ * Supabase Edge Function qua HTTPS. Edge Function sẽ giải mã key2 và insert DB.
+ * @version   3.7 (Edge Function ingest + ASCON key2 cloud payload)
  * @date      2026
  */
 
@@ -31,6 +31,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "sdkconfig.h"
 #include "esp_timer.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
@@ -52,6 +53,8 @@
 #include "mlr_engine.h"
 
 static const char *TAG = "WEATHER_GATEWAY";
+
+#define GW_VERSION "3.7"
 
 /* ==============================================================================
  * 1. CẤU HÌNH PHẦN CỨNG (HARDWARE CONFIGURATION)
@@ -129,6 +132,13 @@ static EventGroupHandle_t s_wifi_event_group = NULL;
     "NzgwOX0.KhjB0T-8Yy34P3p37XipEutwVfraabsG274NL_88J4Q"
 #define DEVICE_ID         "ESP32_LORA_GW"
 
+/* Edge Function ingest endpoint: ESP32 -> Supabase Edge Function -> DB.
+ * EDGE_DEVICE_TOKEN phải khớp với secret INGEST_DEVICE_TOKEN trên Edge Function.
+ * Không đưa token/key2 vào web browser.
+ */
+#define EDGE_FUNCTION_URL  "https://hbuluhjjfivezrrxesaz.supabase.co/functions/v1/ingest-weather"
+#define EDGE_DEVICE_TOKEN  "CHANGE_THIS_LONG_RANDOM_DEVICE_TOKEN"
+
 #define HTTP_POST_TIMEOUT_MS    8000
 #define HTTP_GET_TIMEOUT_MS    10000
 #define HTTP_OTA_TIMEOUT_MS    60000
@@ -145,6 +155,12 @@ extern const char supabase_root_ca_pem_end[]   asm("_binary_supabase_root_ca_pem
 static const uint8_t ASCON_SECRET_KEY[16] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+/** @brief Khóa ASCON key2 dùng riêng cho ESP32 <-> Edge Function. Không đưa vào web. */
+static const uint8_t ASCON_CLOUD_KEY2[16] = {
+    0x66, 0x8A, 0xB1, 0x33, 0x02, 0xC9, 0x4D, 0xE1,
+    0x9F, 0x70, 0x21, 0xA8, 0x5C, 0xD4, 0x77, 0x10
 };
 
 /** @defgroup Sensor_Flags Cờ báo lỗi phần cứng cảm biến */
@@ -195,7 +211,7 @@ typedef struct {
 } AI_DataPoint_t;
 
 static QueueHandle_t s_ai_data_queue = NULL;      /**< Hàng đợi nạp data cho Task AI */
-static QueueHandle_t s_supabase_queue = NULL;     /**< Hàng đợi nạp data chờ gửi lên Cloud */
+static QueueHandle_t s_supabase_queue = NULL;     /**< Hàng đợi nạp data chờ gửi lên Edge Function */
 
 static float g_mlr_predicted_temp_2h = 0.0f;      /**< Lưu trữ kết quả dự báo nhiệt độ 2 giờ tới */
 
@@ -266,113 +282,195 @@ static void ai_task(void *pvParameters) {
 }
 
 /* ==============================================================================
- * 7. NHIỆM VỤ ĐÁM MÂY VÀ GIAO TIẾP MẠNG (CLOUD & NETWORKING)
+ * 7. NHIỆM VỤ EDGE FUNCTION VÀ GIAO TIẾP MẠNG (CLOUD & NETWORKING)
  * ============================================================================== */
 
 /**
- * @brief Hàm đóng gói JSON và thực hiện HTTP POST lên bảng dữ liệu Supabase.
- * @param d Con trỏ chứa dữ liệu đã giải mã từ cảm biến.
+ * @brief Chuyển mảng byte sang chuỗi hex lowercase.
  */
-static void supabase_post_sensor(const SensorDecodedData_t *d) {
-    if (!s_wifi_connected) return;
+static void bytes_to_hex_str(const uint8_t *buf, size_t len, char *out) {
+    static const char hex[] = "0123456789abcdef";
 
-    /*
-     * Dữ liệu lỗi nên gửi null thay vì 0.0 để database không hiểu nhầm là giá trị thật.
-     * Supabase/PostgREST chấp nhận number/null trong JSON.
-     */
-    char temp_str[24], hum_str[24], press_str[24], bat_str[24];
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2]     = hex[(buf[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = hex[ buf[i]       & 0x0F];
+    }
+
+    out[len * 2] = '\0';
+}
+
+/**
+ * @brief Build nonce cho lớp cloud key2.
+ * @details Cùng format với key1 để Edge Function dễ đồng bộ:
+ *          nonce[0..3] = frame_counter big-endian,
+ *          nonce[4..7] = "WSN1",
+ *          nonce[8..15] = 0.
+ */
+static void build_nonce_from_counter_cloud(uint32_t counter, uint8_t nonce[16]) {
+    memset(nonce, 0, 16);
+
+    nonce[0] = (uint8_t)(counter >> 24);
+    nonce[1] = (uint8_t)(counter >> 16);
+    nonce[2] = (uint8_t)(counter >> 8);
+    nonce[3] = (uint8_t)(counter);
+
+    nonce[4] = 0x57U;
+    nonce[5] = 0x53U;
+    nonce[6] = 0x4EU;
+    nonce[7] = 0x31U; /* "WSN1" */
+}
+
+/**
+ * @brief Đóng gói lại dữ liệu sensor thành plaintext 10 byte giống STM32 payload.
+ */
+static void sensor_decoded_to_plaintext10(const SensorDecodedData_t *d,
+                                          uint8_t plaintext[SENSOR_PLAINTEXT_LEN]) {
+    memset(plaintext, 0, SENSOR_PLAINTEXT_LEN);
+
     if (d->sht30_ok) {
-        snprintf(temp_str, sizeof(temp_str), "%.2f", d->env_temp_c);
-        snprintf(hum_str,  sizeof(hum_str),  "%.2f", d->env_humidity_pct);
-    } else {
-        strcpy(temp_str, "null");
-        strcpy(hum_str,  "null");
+        int16_t  temp_raw = (int16_t)(d->env_temp_c * 100.0f);
+        uint16_t hum_raw  = (uint16_t)(d->env_humidity_pct * 100.0f);
+
+        plaintext[0] = (uint8_t)( temp_raw       & 0xFF);
+        plaintext[1] = (uint8_t)((temp_raw >> 8) & 0xFF);
+        plaintext[2] = (uint8_t)( hum_raw        & 0xFF);
+        plaintext[3] = (uint8_t)((hum_raw >> 8)  & 0xFF);
     }
 
     if (d->bmp388_ok) {
-        snprintf(press_str, sizeof(press_str), "%.2f", d->air_pressure_hpa);
-    } else {
-        strcpy(press_str, "null");
+        float press_encoded = (d->air_pressure_hpa - 900.0f) * 100.0f;
+        if (press_encoded < 0.0f) press_encoded = 0.0f;
+        if (press_encoded > 65535.0f) press_encoded = 65535.0f;
+
+        uint16_t press_raw = (uint16_t)press_encoded;
+        plaintext[4] = (uint8_t)( press_raw       & 0xFF);
+        plaintext[5] = (uint8_t)((press_raw >> 8) & 0xFF);
     }
+
+    int16_t btemp_raw = (int16_t)(d->board_temp_c * 100.0f);
+    plaintext[6] = (uint8_t)( btemp_raw       & 0xFF);
+    plaintext[7] = (uint8_t)((btemp_raw >> 8) & 0xFF);
 
     if (d->ina219_ok) {
-        snprintf(bat_str, sizeof(bat_str), "%.3f", d->battery_volt);
-    } else {
-        strcpy(bat_str, "null");
+        float x = ((d->battery_volt - 3.0f) / 1.2f) * 255.0f;
+        if (x < 0.0f) x = 0.0f;
+        if (x > 255.0f) x = 255.0f;
+        plaintext[8] = (uint8_t)x;
     }
 
-    // Đóng gói JSON Payload
-    char body[512];
+    plaintext[9] = d->health_flag;
+}
+
+/**
+ * @brief POST dữ liệu đã mã hóa ASCON key2 lên Supabase Edge Function.
+ * @details ESP32 không insert trực tiếp vào bảng weather_logs nữa.
+ *          Edge Function sẽ giải mã payload_key2, validate và insert plaintext vào DB.
+ */
+static void edge_post_sensor(const SensorDecodedData_t *d) {
+    if (!s_wifi_connected) {
+        ESP_LOGW(TAG, "[EDGE] WiFi chưa sẵn sàng, bỏ qua frame=%" PRIu32, d->frame_counter);
+        return;
+    }
+
+    uint8_t plaintext[SENSOR_PLAINTEXT_LEN] = {0};
+    sensor_decoded_to_plaintext10(d, plaintext);
+
+    uint8_t nonce[16];
+    build_nonce_from_counter_cloud(d->frame_counter, nonce);
+
+    uint8_t ascon_out[SENSOR_PLAINTEXT_LEN + 16] = {0};
+    unsigned long long clen = 0ULL;
+
+    if (crypto_aead_encrypt(ascon_out, &clen,
+                            plaintext, SENSOR_PLAINTEXT_LEN,
+                            NULL, 0, NULL,
+                            nonce, ASCON_CLOUD_KEY2) != 0) {
+        ESP_LOGE(TAG, "[EDGE] ❌ ASCON key2 encrypt fail");
+        return;
+    }
+
+    if (clen < (SENSOR_PLAINTEXT_LEN + ASCON_TAG4_LEN)) {
+        ESP_LOGE(TAG, "[EDGE] ❌ ASCON key2 output quá ngắn: clen=%llu", clen);
+        return;
+    }
+
+    uint8_t payload_key2[SENSOR_PLAINTEXT_LEN + ASCON_TAG4_LEN];
+    memcpy(payload_key2, ascon_out, SENSOR_PLAINTEXT_LEN);
+    memcpy(payload_key2 + SENSOR_PLAINTEXT_LEN, ascon_out + SENSOR_PLAINTEXT_LEN, ASCON_TAG4_LEN);
+
+    char payload_hex[(SENSOR_PLAINTEXT_LEN + ASCON_TAG4_LEN) * 2 + 1];
+    bytes_to_hex_str(payload_key2, sizeof(payload_key2), payload_hex);
+
+    char body[384];
     int body_len = snprintf(body, sizeof(body),
         "{"
-        "\"frame_counter\":%"PRIu32","
-        "\"temperature\":%s,"
-        "\"humidity\":%s,"
-        "\"pressure\":%s,"
-        "\"board_temp\":%.2f,"
-        "\"battery\":%s,"
-        "\"predicted_temp_2h\":%.2f,"
-        "\"device_id\":\"%s\""
+        "\"device_id\":\"%s\","
+        "\"frame_counter\":%" PRIu32 ","
+        "\"payload_key2\":\"%s\","
+        "\"predicted_temp_2h\":%.2f"
         "}",
+        DEVICE_ID,
         d->frame_counter,
-        temp_str,
-        hum_str,
-        press_str,
-        d->board_temp_c,
-        bat_str,
-        g_mlr_predicted_temp_2h,
-        DEVICE_ID
+        payload_hex,
+        g_mlr_predicted_temp_2h
     );
 
-    ESP_LOGI(TAG, "[SUPABASE] Chuẩn bị POST: %s", body);
+    if (body_len <= 0 || body_len >= (int)sizeof(body)) {
+        ESP_LOGE(TAG, "[EDGE] JSON body overflow, frame=%" PRIu32, d->frame_counter);
+        return;
+    }
 
-    char url[160];
-    snprintf(url, sizeof(url), "%s/rest/v1/%s", SUPABASE_URL, SUPABASE_TABLE);
+    ESP_LOGI(TAG, "[EDGE] POST v%s frame=%" PRIu32 " payload_key2=%s",
+             GW_VERSION, d->frame_counter, payload_hex);
 
     esp_http_client_config_t http_cfg = {
-        .url               = url,
+        .url               = EDGE_FUNCTION_URL,
         .method            = HTTP_METHOD_POST,
         .timeout_ms        = HTTP_POST_TIMEOUT_MS,
         .buffer_size       = 4096,
-        .buffer_size_tx    = 2048,
-        .keep_alive_enable = true, // Giữ kết nối TCP để POST nhanh hơn ở lần sau
+        .buffer_size_tx    = 1024,
+        .keep_alive_enable = true,
     };
-    tls_cfg_fill(&http_cfg); 
+    tls_cfg_fill(&http_cfg);
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
-    if (!client) { ESP_LOGE(TAG, "[SUPABASE] Khởi tạo HTTP Client thất bại."); return; }
+    if (!client) {
+        ESP_LOGE(TAG, "[EDGE] Khởi tạo HTTP Client thất bại");
+        return;
+    }
 
-    esp_http_client_set_header(client, "Content-Type",  "application/json");
-    esp_http_client_set_header(client, "apikey",        SUPABASE_ANON_KEY);
-    esp_http_client_set_header(client, "Authorization", "Bearer " SUPABASE_ANON_KEY);
-    esp_http_client_set_header(client, "Prefer",        "return=minimal"); // Tối ưu băng thông trả về
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "x-device-token", EDGE_DEVICE_TOKEN);
     esp_http_client_set_post_field(client, body, body_len);
 
     esp_err_t err = esp_http_client_perform(client);
+
     if (err == ESP_OK) {
         int st = esp_http_client_get_status_code(client);
-        if (st == 201 || st == 200)
-            ESP_LOGI(TAG, "[SUPABASE] ✅ HTTP %d - Đã lưu dữ liệu.", st);
-        else
-            ESP_LOGW(TAG, "[SUPABASE] ⚠ HTTP %d — Kiểm tra quyền RLS trên Supabase.", st);
+
+        if (st == 200 || st == 201) {
+            ESP_LOGI(TAG, "[EDGE] ✅ HTTP %d — Edge Function đã nhận frame=%" PRIu32,
+                     st, d->frame_counter);
+        } else {
+            ESP_LOGW(TAG, "[EDGE] ⚠ HTTP %d — body=%s", st, body);
+        }
     } else {
-        ESP_LOGE(TAG, "[SUPABASE] ❌ Lỗi mạng: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "[EDGE] ❌ HTTP error: %s", esp_err_to_name(err));
     }
+
     esp_http_client_cleanup(client);
 }
 
 /**
- * @brief Task xử lý Hàng đợi Cloud (Mô hình Consumer).
- * @details Cách ly quá trình kết nối mạng (chặn luồng/blocking) khỏi quá trình bắt sóng vô tuyến.
- * @param pvParameters Tham số truyền vào Task.
+ * @brief Task xử lý hàng đợi Cloud/Edge.
+ * @details Cách ly quá trình HTTP blocking khỏi quá trình nhận LoRa.
  */
 static void supabase_task(void *pvParameters) {
     SensorDecodedData_t data_to_post;
 
     while (1) {
-        // Lấy dữ liệu từ hàng đợi, block vô hạn nếu hàng đợi trống
         if (xQueueReceive(s_supabase_queue, &data_to_post, portMAX_DELAY) == pdPASS) {
-            supabase_post_sensor(&data_to_post);
+            edge_post_sensor(&data_to_post);
         }
     }
 }
@@ -678,9 +776,9 @@ static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
         xQueueSend(s_ai_data_queue, &dp, 0); // Không block nếu đầy
     }
     
-    /* 2. Đẩy dữ liệu nguyên vẹn sang hàng đợi của Supabase HTTP POST */
+    /* 2. Đẩy dữ liệu nguyên vẹn sang hàng đợi Edge Function HTTP POST */
     if (xQueueSend(s_supabase_queue, &decoded, pdMS_TO_TICKS(10)) != pdPASS) {
-        ESP_LOGW(TAG, "[LORA_RX] ⚠ Mạng chậm, Queue Supabase đầy. Rớt gói để tránh nghẽn UART.");
+        ESP_LOGW(TAG, "[LORA_RX] ⚠ Mạng chậm, Queue Edge đầy. Rớt gói để tránh nghẽn UART.");
     }
 }
 
@@ -864,6 +962,9 @@ void app_main(void) {
     ESP_LOGI(TAG, "================================================");
     ESP_LOGI(TAG, "  TRẠM QUAN TRẮC MLR NOWCASTING (2H FORECAST)  ");
     ESP_LOGI(TAG, "================================================");
+    ESP_LOGI(TAG, "[VERSION] GW_VERSION=%s", GW_VERSION);
+    ESP_LOGI(TAG, "[TARGET] CONFIG_IDF_TARGET=%s", CONFIG_IDF_TARGET);
+    ESP_LOGI(TAG, "[ARCH] STM32 -> LoRa ASCON key1 -> ESP32 -> Edge ASCON key2 -> DB");
 
     /* 0. NVS dùng cho WiFi + OTA. Khởi tạo một lần ở đầu chương trình. */
     app_nvs_init();
@@ -872,7 +973,7 @@ void app_main(void) {
     gpio_set_direction(E32_M0_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(E32_M1_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(E32_AUX_PIN, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(E32_AUX_PIN, GPIO_FLOATING);
+    gpio_set_pull_mode(E32_AUX_PIN, GPIO_PULLUP_ONLY);
 
     gpio_set_level(E32_M0_PIN, 0);
     gpio_set_level(E32_M1_PIN, 0);
@@ -949,11 +1050,11 @@ void app_main(void) {
         ESP_LOGE(TAG, "[NTP] ❌ Đồng bộ thời gian thất bại. TLS có thể lỗi nếu đồng hồ sai.");
     }
 
-    /* 9. Bật task cloud sau khi network đã init. */
-    xTaskCreatePinnedToCore(supabase_task, "SBASE_TASK", 8192, NULL, 4, NULL, 0);
+    /* 9. Bật task Edge/OTA sau khi network đã init. */
+    xTaskCreatePinnedToCore(supabase_task, "EDGE_TASK", 8192, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore(ota_task, "OTA_TASK", 8192, NULL, 4, NULL, 1);
 
-    ESP_LOGI(TAG, "[BOOT] Gateway đã chạy. Theo dõi log [LORA_RX_RAW] để biết UART có byte vào hay không.");
+    ESP_LOGI(TAG, "[BOOT] Gateway v%s đã chạy. LoRa RX -> Edge Function POST.", GW_VERSION);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(60000));
