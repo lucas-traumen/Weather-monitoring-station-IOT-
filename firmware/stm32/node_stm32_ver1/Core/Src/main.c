@@ -46,8 +46,8 @@
  * - RTC heartbeat must be lower than IWDG timeout.
  * - TX every 30s = 3 heartbeats x 10s.
  */
-#define APP_RTC_HEARTBEAT_SEC       10U
-#define APP_TX_PERIOD_SEC           30U
+#define APP_RTC_HEARTBEAT_SEC       5U
+#define APP_TX_PERIOD_SEC           10U
 #define APP_TX_HEARTBEATS           (APP_TX_PERIOD_SEC / APP_RTC_HEARTBEAT_SEC)
 
 #define BKP_MAGIC_VALUE             0xA55AU
@@ -93,7 +93,7 @@ static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_IWDG_Init(void);
 static void MX_USART2_UART_Init(void);
-static void MX_USART1_UART_Init(void);
+//static void MX_USART1_UART_Init(void);
 static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
 
@@ -565,11 +565,15 @@ int main(void)
 
     //(Nếu có I2C2 dùng PB10/PB11, gọi thêm 1 lần nữa cho I2C2)
      I2C_Recover_Bus(GPIOB, GPIO_PIN_10, GPIOB, GPIO_PIN_11);
+     HAL_GPIO_WritePin(TPS_PS_SYNC_GPIO_Port, TPS_PS_SYNC_Pin, GPIO_PIN_SET);
+     HAL_Delay(3000);
+     HAL_GPIO_WritePin(TPS_PS_SYNC_GPIO_Port, TPS_PS_SYNC_Pin, GPIO_PIN_RESET);
+     HAL_Delay(1000);
   MX_I2C1_Init();
   MX_I2C2_Init();
   MX_IWDG_Init();
   MX_USART2_UART_Init();
-  MX_USART1_UART_Init();
+ // MX_USART1_UART_Init();
   MX_RTC_Init();
   /* USER CODE BEGIN 2 */
 
@@ -873,33 +877,33 @@ static void MX_RTC_Init(void)
   * @param None
   * @retval None
   */
-static void MX_USART1_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
-
-}
+//static void MX_USART1_UART_Init(void)
+//{
+//
+//  /* USER CODE BEGIN USART1_Init 0 */
+//
+//  /* USER CODE END USART1_Init 0 */
+//
+//  /* USER CODE BEGIN USART1_Init 1 */
+//
+//  /* USER CODE END USART1_Init 1 */
+//  huart1.Instance = USART1;
+//  huart1.Init.BaudRate = 115200;
+//  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+//  huart1.Init.StopBits = UART_STOPBITS_1;
+//  huart1.Init.Parity = UART_PARITY_NONE;
+//  huart1.Init.Mode = UART_MODE_TX_RX;
+//  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+//  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+//  if (HAL_UART_Init(&huart1) != HAL_OK)
+//  {
+//    Error_Handler();
+//  }
+//  /* USER CODE BEGIN USART1_Init 2 */
+//
+//  /* USER CODE END USART1_Init 2 */
+//
+//}
 
 /**
   * @brief USART2 Initialization Function

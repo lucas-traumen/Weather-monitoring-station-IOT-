@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>IoTSenseHub — Analytics</title>
+  <title>IoTSenseHub — Charts</title>
   <link rel="stylesheet" href="style.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
@@ -12,8 +12,8 @@
 
   <!-- ══ SIDEBAR ══════════════════════════════════════════════ -->
   <aside class="sidebar">
-    <div class="sidebar-logo">⚡</div>
-    <div class="sidebar-brand">IoT<br>Sense</div>
+    <div class="sidebar-logo sidebar-logo-img-wrap"><img src="assets/logo_crop.png" alt="IoTSenseHub logo" class="sidebar-logo-img" onerror="this.style.display='none';this.parentElement.classList.add('logo-fallback');"></div>
+    <div class="sidebar-brand">IoTSense<br>Hub</div>
 
     <nav class="sidebar-nav">
       <a href="index.html" class="sidebar-item">
@@ -65,8 +65,9 @@
         </div>
       </div>
       <div class="config-note">
-        Để chuyển sang ESP32 thật: đổi <code style="color:var(--amber);font-size:.72rem">MODE = "REAL"</code>
-        trong <code style="color:var(--amber);font-size:.72rem">config.js</code>.
+        Pipeline hiện tại: <code style="color:var(--amber);font-size:.72rem">ESP32</code>
+        → <code style="color:var(--amber);font-size:.72rem">Edge Function</code>
+        → <code style="color:var(--amber);font-size:.72rem">DB plaintext</code>.
       </div>
     </div>
   </div>
@@ -77,7 +78,6 @@
     <header class="topbar">
       <div class="topbar-left">
         <div class="topbar-title">Data Analytics</div>
-        <div class="topbar-sub">Historical sensor data · Last <span id="pointCount">--</span> records · Auto-updates via Realtime</div>
       </div>
       <div class="topbar-right">
         <div class="conn-pill">
@@ -108,7 +108,7 @@
       <!-- Charts -->
       <div class="chart-box">
         <div class="chart-box-header">
-          <span class="chart-label" style="color:var(--col-temp)">Temperature — °C</span>
+          <span class="chart-label" style="color:var(--col-temp)">Temperature — Actual vs +2h Forecast</span>
           <span class="chart-live-val" id="liveTemp">--</span>
         </div>
         <div class="chart-canvas-wrap"><canvas id="tempChart"></canvas></div>
@@ -139,7 +139,6 @@
       </div>
 
       <div class="page-footer">
-        <span>IoTSenseHub v3.0 · Chart.js</span>
         <span>Showing <span id="shownCount">--</span> / <span id="totalCount">--</span> total records</span>
       </div>
 

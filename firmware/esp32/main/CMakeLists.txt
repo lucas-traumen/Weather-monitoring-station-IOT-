@@ -18,4 +18,7 @@ idf_component_register(
         bootloader_support
         esp_https_ota
         ML
+        cjson
+        network_provisioning
+        bt
 )

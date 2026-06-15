@@ -3,15 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>IoTSenseHub — Dashboard & MLOps</title>
+  <title>IoTSenseHub — Dashboard</title>
   <link rel="stylesheet" href="style.css" />
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
 </head>
 <body>
 
   <aside class="sidebar">
-    <div class="sidebar-logo">⚡</div>
-    <div class="sidebar-brand">IoT<br>Sense</div>
+    <div class="sidebar-logo sidebar-logo-img-wrap">
+      <img src="assets/logo_crop.png" alt="IoTSenseHub logo" class="sidebar-logo-img">
+    </div>
+    <div class="sidebar-brand">IoTSense<br>Hub</div>
 
     <nav class="sidebar-nav">
       <a href="index.html" class="sidebar-item active">
@@ -34,7 +36,7 @@
   </aside>
 
   <div class="config-overlay" id="config-modal">
-    <div class="config-modal">
+    <div class="config-modal config-modal-wide">
       <div class="config-modal-header">
         <div class="config-modal-title">⚙ System Configuration</div>
         <a href="#" class="config-close" title="Đóng">✕</a>
@@ -59,17 +61,32 @@
         </div>
         <div class="config-row">
           <span class="cr-key">REALTIME</span>
-          <span class="cr-val val-green">Enabled (PostgreSQL Changes)</span>
-        </div>
-        <div class="config-row">
-          <span class="cr-key">FIRMWARE OTA</span>
-          <span class="cr-val">Supabase Storage · bucket: firmware</span>
+          <span class="cr-val val-green">Enabled — PostgreSQL Changes</span>
         </div>
       </div>
 
       <div class="config-note">
-        Để chuyển sang ESP32 thật: đổi <code style="color:var(--amber);font-size:.72rem">MODE = "REAL"</code>
-        trong <code style="color:var(--amber);font-size:.72rem">config.js</code> và đóng tab simulator.
+        Pipeline hiện tại:
+        <code>ESP32 Gateway</code>
+        → <code>Supabase Edge Function</code>
+        → <code>weather_logs plaintext</code>.
+        Browser chỉ đọc dữ liệu đã giải mã trong database, không chứa ASCON key.
+      </div>
+
+      <div class="config-ota-block">
+        <div class="ota-header">
+          <span style="font-size:1.05rem">🚀</span>
+          <span class="ota-title">OTA Remote Deployment</span>
+        </div>
+        <p class="ota-desc">
+          Chọn file firmware <b>.bin</b>, web sẽ tính SHA-256, tải lên Supabase Storage
+          và ghi <code>ota_url</code>, <code>ota_seq</code>, <code>ota_sha256</code> vào bảng cấu hình thiết bị.
+        </p>
+        <div class="ota-form">
+          <input type="file" id="otaFileInput" accept=".bin" class="ota-input" />
+          <button class="ota-btn">Tải lên &amp; phát lệnh</button>
+        </div>
+        <div class="ota-log" id="otaStatusLog">Trạng thái: Sẵn sàng nhận file .bin</div>
       </div>
     </div>
   </div>
@@ -78,8 +95,8 @@
 
     <header class="topbar">
       <div class="topbar-left">
-        <div class="topbar-title">Sensor Monitor &amp; MLOps Engine</div>
-        <div class="topbar-sub">Real-time Environmental Data · Edge AI Operations</div>
+        <div class="topbar-title">Sensor Monitor</div>
+        <div class="topbar-sub">Realtime weather telemetry dashboard</div>
       </div>
       <div class="topbar-right">
         <div class="conn-pill">
@@ -90,16 +107,16 @@
       </div>
     </header>
 
-    <div class="container">
+    <main class="container">
 
       <div class="info-row">
         <div class="info-chip">
-          <span class="ic-label">Mode</span>
-          <span class="ic-val mode-real" id="modeChip">REAL</span>
-        </div>
-        <div class="info-chip">
           <span class="ic-label">Device</span>
           <span class="ic-val" id="deviceChip">--</span>
+        </div>
+        <div class="info-chip">
+          <span class="ic-label">Frame</span>
+          <span class="ic-val" id="frameChip">--</span>
         </div>
         <div class="info-chip">
           <span class="ic-label">Records</span>
@@ -110,291 +127,108 @@
           <span class="ic-val live" id="uptimeChip">00:00:00</span>
         </div>
         <div class="info-chip">
-          <span class="ic-label">Last Update</span>
+          <span class="ic-label">Last update</span>
           <span class="ic-val" id="lastUpdateChip">--</span>
-        </div>
-      </div>
-
-      <div class="status-bar">
-        <div class="status-bar-left">
-          <span class="status-bar-icon">📡</span>
-          <div class="status-bar-meta">
-            <span class="status-bar-title">Telemetry Link</span>
-            <span class="status-bar-desc">Node Cảm Biến LoRa</span>
-          </div>
-        </div>
-        <div class="status-pill">
-          <strong id="sensor-status-text">Đang phân tích...</strong>
         </div>
       </div>
 
       <div class="section-label">Môi trường thực tế — Sensor Metrics</div>
 
-      <div class="dashboard-body">
+      <section class="dashboard-body dashboard-slim">
 
-        <div class="hero-card">
-
-          <div>
-            <div class="hero-label">🌡 Temperature</div>
-            <div class="hero-value" id="temperature">--<span class="unit">°C</span></div>
-            <div class="hero-sub" id="tempSub">—</div>
+        <article class="hero-card hero-clean">
+          <div class="hero-main">
+            <div class="hero-label">🌡 Nhiệt độ hiện tại</div>
+            <div class="hero-value">
+              <span id="temperature">--</span><span class="unit">°C</span>
+            </div>
+            <div class="hero-sub" id="tempSub">Chờ dữ liệu cảm biến...</div>
           </div>
 
-          <div class="hero-mid">
-            <div class="hero-status-line">
-              <span class="hero-status-icon">📶</span>
-              <span id="hero-status-inline">Đang kiểm tra tín hiệu...</span>
+          <div class="hero-summary-row">
+            <div class="summary-item">
+              <span class="summary-label">Trạng thái</span>
+              <span class="summary-value" id="sensor-status-text">Đang phân tích...</span>
             </div>
-            <div class="hero-secondaries">
-              <div class="hero-sec">
-                <span class="hero-sec-lbl">🎛 Board Temp</span>
-                <span class="hero-sec-val" id="hero-boardtemp">-- °C</span>
-              </div>
-              <div class="hero-sec">
-                <span class="hero-sec-lbl">🔋 Battery</span>
-                <span class="hero-sec-val" id="hero-battery">-- V</span>
-              </div>
-              <div class="hero-sec">
-                <span class="hero-sec-lbl">📡 Device</span>
-                <span class="hero-sec-val" id="hero-device">--</span>
-              </div>
+            <div class="summary-item">
+              <span class="summary-label">Node</span>
+              <span class="summary-value" id="nodeLabel">Node 1</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label">Health flag</span>
+              <span class="summary-value" id="healthFlag">--</span>
             </div>
           </div>
+        </article>
 
-          <div>
-            <div class="hero-divider"></div>
-            <div class="hero-bottom">
-              <div class="hero-stat">
-                <span class="hero-stat-label">💧 Humidity</span>
-                <span class="hero-stat-val" id="humidity-mini">-- %</span>
-              </div>
-              <div class="hero-stat">
-                <span class="hero-stat-label">🌀 Pressure</span>
-                <span class="hero-stat-val" id="pressure-mini">-- hPa</span>
-              </div>
-              <div class="hero-stat">
-                <span class="hero-stat-label">🔮 Pred (2h)</span>
-                <span class="hero-stat-val" id="pred-mini" style="color:var(--indigo-light)">-- °C</span>
-              </div>
-              <div class="hero-stat">
-                <span class="hero-stat-label">🕒 Updated</span>
-                <span class="hero-stat-val" id="updated">--</span>
-              </div>
-            </div>
-          </div>
-
-        </div><div class="highlight-panel">
-
-          <div class="highlight-card" style="--hc-col:var(--col-hum)">
+        <section class="highlight-panel metrics-panel">
+          <article class="highlight-card" style="--hc-col:var(--col-hum)">
             <div class="hc-icon">💧</div>
             <div class="hc-body">
               <div class="hc-label">Humidity</div>
-              <div class="hc-value" id="humidity">--<span class="unit">%</span></div>
-              <div class="hc-sub" id="humSub">—</div>
+              <div class="hc-value"><span id="humidity">--</span><span class="unit">%</span></div>
+              <div class="hc-sub" id="humSub">Độ ẩm tương đối</div>
             </div>
-          </div>
+          </article>
 
-          <div class="highlight-card" style="--hc-col:var(--col-pres)">
+          <article class="highlight-card" style="--hc-col:var(--col-pres)">
             <div class="hc-icon">🌀</div>
             <div class="hc-body">
               <div class="hc-label">Pressure</div>
-              <div class="hc-value" id="pressure">--<span class="unit">hPa</span></div>
-              <div class="hc-sub" id="presSub">—</div>
+              <div class="hc-value"><span id="pressure">--</span><span class="unit">hPa</span></div>
+              <div class="hc-sub" id="presSub">Áp suất khí quyển</div>
             </div>
-          </div>
+          </article>
 
-          <div class="highlight-card" style="--hc-col:var(--col-board)">
+          <article class="highlight-card" style="--hc-col:var(--col-board)">
             <div class="hc-icon">🎛️</div>
             <div class="hc-body">
               <div class="hc-label">Board Temp</div>
-              <div class="hc-value" id="board_temp">--<span class="unit">°C</span></div>
+              <div class="hc-value"><span id="board_temp">--</span><span class="unit">°C</span></div>
               <div class="hc-sub" id="boardTempSub">Nhiệt độ bo mạch</div>
             </div>
-          </div>
+          </article>
 
-          <div class="highlight-card mc-bat" id="batCard" style="--hc-col:var(--col-bat)">
+          <article class="highlight-card mc-bat" id="batCard" style="--hc-col:var(--col-bat)">
             <div class="hc-icon">🔋</div>
             <div class="hc-body">
               <div class="hc-label">Battery</div>
-              <div class="hc-value mc-value" id="battery">--<span class="unit">V</span></div>
-              <div class="hc-sub mc-sub" id="batSub">—</div>
+              <div class="hc-value"><span id="battery">--</span><span class="unit">V</span></div>
+              <div class="hc-sub" id="batSub">Trạng thái nguồn</div>
             </div>
-          </div>
+          </article>
+        </section>
 
-        </div></div><div class="section-label">Edge AI Telemetry — Hồi quy tuyến tính đa biến (MLR)</div>
+      </section>
 
-      <div class="ai-grid" style="grid-template-columns: 1fr;">
-        <div class="ai-card" style="--ai-col:var(--indigo-light); max-width: 500px; margin: 0 auto; text-align: center;">
-          <div class="ai-label" style="justify-content: center;">
+      <div class="section-label">Edge AI Telemetry — Multiple Linear Regression</div>
+
+      <section class="prediction-panel">
+        <div class="prediction-left">
+          <div class="ai-label">
             <span class="ai-icon">🔮</span>
-            <span class="ai-label-text">Dự báo Nhiệt độ (2 giờ tới)</span>
+            <span class="ai-label-text">Dự báo nhiệt độ sau 2 giờ</span>
           </div>
-          <div class="ai-value cyan" id="predicted_temp_2h">--<span class="unit">°C</span></div>
-          <div class="ai-sub" id="predictedSub">Suy luận tức thời dựa trên thuật toán MLR tại vi điều khiển</div>
+          <div class="prediction-note" id="predictedSub">
+            Giá trị dự báo MLR được hiểu tại thời điểm đo + 2 giờ, không phải nhiệt độ hiện tại.
+          </div>
         </div>
-      </div>
-
-      <div class="section-label">MLOps Control — OTA Remote Deployment</div>
-
-      <div class="ota-panel">
-        <div class="ota-header">
-          <span style="font-size:1.1rem">🚀</span>
-          <span class="ota-title">Over-The-Air (OTA) Remote Deployment</span>
+        <div class="prediction-value">
+          <span id="predicted_temp_2h">--</span><span class="unit">°C</span>
         </div>
-        <p class="ota-desc">
-          Tải file firmware (.bin) từ máy tính lên Supabase Storage để tự động phân phối xuống thiết bị Gateway thực địa.
-        </p>
-        <div class="ota-form">
-          <input type="file" id="otaFileInput" accept=".bin" class="ota-input" />
-          <button class="ota-btn" onclick="uploadAndDeployFirmware()">
-            📁 Tải lên &amp; Phát lệnh
-          </button>
-        </div>
-        <div class="ota-log" id="otaStatusLog">Trạng thái: Sẵn sàng nhận file .bin</div>
-      </div>
+      </section>
 
       <div class="page-footer">
-        <span>Updated: <span id="updated-footer">--</span></span>
-        <span>IoTSenseHub v3.5 · MLOps MLR Pipeline</span>
+        <span>Web version: <span id="webVersionLabel">--</span></span>
+        <span>Forecast display: actual at <code>created_at</code>, forecast at <code>created_at + 2h</code></span>
       </div>
 
-    </div></div><script src="config.js"></script>
+    </main>
+  </div>
+
+  <script src="config.js"></script>
   <script src="supabase.js"></script>
   <script src="app.js"></script>
-
-  <script>
-    // ── Config modal: fill values from CONFIG ─────────────────
-    document.getElementById('cfgMode').textContent  = CONFIG.MODE;
-    document.getElementById('cfgTable').textContent = CONFIG.API.TABLE;
-    document.getElementById('cfgUrl').textContent   = CONFIG.SUPABASE_URL;
-    document.getElementById('cfgLimit').textContent = CONFIG.FETCH_LIMIT;
-    document.getElementById('cfgMode').className    = 'cr-val ' + (CONFIG.MODE === 'DEMO' ? 'mode-sim' : 'mode-real');
-
-    // ── Mode badge/chip ────────────────────────────────────────
-    const modeEl = document.getElementById('modeChip');
-    modeEl.textContent = CONFIG.MODE;
-    modeEl.className   = 'ic-val ' + (CONFIG.MODE === 'DEMO' ? 'mode-sim' : 'mode-real');
-
-    // ── Uptime counter ─────────────────────────────────────────
-    const _t0 = Date.now();
-    setInterval(() => {
-      const s  = Math.floor((Date.now() - _t0) / 1000);
-      const hh = String(Math.floor(s / 3600)).padStart(2, '0');
-      const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
-      const ss = String(s % 60).padStart(2, '0');
-      document.getElementById('uptimeChip').textContent = `${hh}:${mm}:${ss}`;
-    }, 1000);
-
-    // ── Record count ───────────────────────────────────────────
-    async function updateCount() {
-      try {
-        const { count } = await supabaseClient
-          .from(CONFIG.API.TABLE).select('*', { count: 'exact', head: true });
-        document.getElementById('recordsChip').textContent = count ?? '--';
-      } catch {}
-    }
-    updateCount();
-    setInterval(updateCount, 10000);
-
-    // ── MutationObservers for flash + side effects ─────────────
-    // Đã xóa các ID cũ như 'warning', 'beta_pressure', 'trend'
-    const flashIds = [
-      'temperature', 'humidity', 'pressure', 'battery', 
-      'predicted_temp_2h', 'board_temp'
-    ];
-
-    flashIds.forEach(id => {
-      const el = document.getElementById(id);
-      if (!el) return;
-
-      new MutationObserver(() => {
-        // Flash animation
-        el.classList.remove('flash-anim');
-        void el.offsetWidth;
-        el.classList.add('flash-anim');
-
-        // Live indicator
-        document.getElementById('connDot')?.classList.add('live');
-        document.getElementById('connLabel').textContent = 'LIVE';
-
-        // ── Sync hero-mid secondary values ─────────────────────
-        if (id === 'board_temp') {
-          const dst = document.getElementById('hero-boardtemp');
-          if (dst) dst.textContent = el.textContent;
-        }
-        if (id === 'battery') {
-          const dst = document.getElementById('hero-battery');
-          if (dst) dst.textContent = el.textContent;
-        }
-        if (id === 'predicted_temp_2h') {
-          const dst = document.getElementById('pred-mini');
-          if (dst) dst.textContent = el.textContent;
-        }
-
-        // ── Sync hero device ───────────────────────────────────
-        if (id === 'temperature') {
-          const devSrc = document.getElementById('deviceChip');
-          const heroDev = document.getElementById('hero-device');
-          if (devSrc && heroDev) heroDev.textContent = devSrc.textContent;
-          // Sync footer updated
-          const upd    = document.getElementById('updated');
-          const footer = document.getElementById('updated-footer');
-          if (upd && footer) footer.textContent = upd.textContent;
-        }
-
-        // ── Sync hero-status-inline from sensor-status-text ───
-        if (id === 'temperature') {
-          const src = document.getElementById('sensor-status-text');
-          const dst = document.getElementById('hero-status-inline');
-          if (src && dst) {
-            dst.innerHTML   = src.innerHTML;
-            dst.style.color = src.style.color;
-          }
-        }
-
-        // ── Sync hero bottom mini values ───────────────────────
-        if (id === 'humidity') {
-          const m = document.getElementById('humidity-mini');
-          if (m) m.textContent = el.textContent;
-        }
-        if (id === 'pressure') {
-          const m = document.getElementById('pressure-mini');
-          if (m) m.textContent = el.textContent;
-        }
-
-        // ── Battery low state ──────────────────────────────────
-        if (id === 'battery') {
-          const val     = parseFloat(el.textContent);
-          const batCard = document.getElementById('batCard');
-          if (batCard) batCard.classList.toggle('low', !isNaN(val) && val < 3.6);
-          const batSub = document.getElementById('batSub');
-          if (batSub && !isNaN(val)) {
-            batSub.textContent = val >= 4.0 ? '🟢 Full' : val >= 3.6 ? '🟡 Good' : '🔴 Low — charge soon';
-          }
-        }
-
-      }).observe(el, { childList: true, characterData: true, subtree: true });
-    });
-
-    // Also watch sensor-status-text separately for watchdog updates
-    const stSrc = document.getElementById('sensor-status-text');
-    if (stSrc) {
-      new MutationObserver(() => {
-        const dst = document.getElementById('hero-status-inline');
-        if (dst) {
-          dst.innerHTML   = stSrc.innerHTML;
-          dst.style.color = stSrc.style.color;
-        }
-      }).observe(stSrc, { childList: true, characterData: true, subtree: true });
-    }
-    
-    // Gán đồng bộ bộ đếm frame_counter vào packetCounter nếu có
-    setInterval(() => {
-      const records = document.getElementById('recordsChip')?.textContent || '--';
-      const packet = document.getElementById('packetCounter');
-      if(packet) packet.textContent = records;
-    }, 1000);
-  </script>
 
 </body>
 </html>

@@ -4,7 +4,7 @@
  * @details   Chịu trách nhiệm nhận dữ liệu LoRa, giải mã ASCON-128a, chạy mô hình AI 
  * (Hồi quy tuyến tính đa biến - MLR) dự báo nhiệt độ, và đẩy dữ liệu lên 
  * Supabase qua giao thức HTTPS. Có tích hợp OTA Update.
- * @version   3.5 (MLR Nowcasting)
+ * @version   3.8.3.17-production-wifi-ble
  * @date      2026
  */
 
@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <inttypes.h>
 #include <time.h>
 #include <sys/time.h>
@@ -31,6 +32,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "sdkconfig.h"
 #include "esp_timer.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
@@ -42,8 +44,15 @@
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_crt_bundle.h"
 #include "esp_sntp.h"
+#include "esp_task_wdt.h"
+#include "esp_mac.h"
+#include "esp_system.h"
+#include "esp_idf_version.h"
+#include "network_provisioning/manager.h"
+#include "network_provisioning/scheme_ble.h"
 
 /* External Libraries */
 #include "cJSON.h"
@@ -69,8 +78,18 @@ static const char *TAG = "WEATHER_GATEWAY";
 #define E32_FRAME_LEN         18    /**< Tổng chiều dài khung truyền LoRa (bytes) */
 #define E32_FRAME_IDLE_MS     150   /**< Thời gian timeout để nhận biết kết thúc khung */
 #define SENSOR_PLAINTEXT_LEN  10    /**< Kích thước dữ liệu gốc chưa mã hóa */
-#define ASCON_TAG4_LEN        4     /**< Kích thước thẻ xác thực ASCON */
+#define ASCON_TAG4_LEN        4     /**< Tag LoRa legacy STM32 -> ESP32: giữ 4 byte để không phá node STM32 hiện tại */
 #define ASCON_INPUT_LEN       (SENSOR_PLAINTEXT_LEN + ASCON_TAG4_LEN)
+
+/*
+ * ASCON Cloud tag ESP32 -> Edge Function:
+ * - Tăng lên full 16 byte để chống giả mạo/sửa gói mạnh hơn.
+ * - LoRa vẫn giữ tag4 ở bản này để không đổi frame STM32.
+ * - payload_key2 = ciphertext 10 byte + tag16 16 byte = 26 byte = 52 hex.
+ */
+#define ASCON_CLOUD_TAG_LEN        16
+#define ASCON_CLOUD_INPUT_LEN      (SENSOR_PLAINTEXT_LEN + ASCON_CLOUD_TAG_LEN)
+#define ASCON_CLOUD_HEX_LEN        (ASCON_CLOUD_INPUT_LEN * 2)
 
 /** @defgroup LoRa_Reg Các thanh ghi cấu hình LoRa E32-433T30D */
 #define E32_CFG_ADDH          0x00
@@ -79,6 +98,7 @@ static const char *TAG = "WEATHER_GATEWAY";
 #define E32_CFG_CHAN          0x17
 #define E32_CFG_OPTION        0x44
 #define E32_CMD_WRITE_FLASH   0xC0
+#define E32_CMD_READ_CONFIG    0xC1
 
 /*
  * E32 UART baudrate:
@@ -91,47 +111,101 @@ static const char *TAG = "WEATHER_GATEWAY";
 #define E32_CFG_PACKET_LEN    6
 #define E32_AUX_TIMEOUT_MS    1500
 
-/* Bật log raw UART để debug lúc chưa nhận được gói LoRa. Khi chạy ổn có thể đổi về 0. */
-#define LORA_DEBUG_RAW_RX     1
+/* Bật log raw UART để debug lúc chưa nhận được gói LoRa. Khi chạy thật để 0 để giảm tải log. */
+#define LORA_DEBUG_RAW_RX     0
+
+/*
+ * RAM-only replay check:
+ * - Phù hợp với quy trình demo/lab: reset cả STM32 + ESP32 + DB thì counter bắt đầu lại từ 0.
+ * - Không lưu NVS để tránh kẹt khi bạn chủ động reset toàn bộ hệ thống.
+ * - Nếu chỉ reset STM32 mà không reset ESP32, counter STM32 về 0 sẽ bị bỏ; khi đó tạm đổi về 0 để debug.
+ */
+#define LORA_ENABLE_RAM_REPLAY_CHECK 1
 
 /* ==============================================================================
  * 2. CẤU HÌNH MẠNG VÀ ĐÁM MÂY (NETWORK & CLOUD CONFIG)
  * ============================================================================== */
 
 /**
- * @brief Thông tin danh sách WiFi dự phòng (Multi-AP Fallback)
+ * @brief Phiên bản firmware hiện tại.
+ * @note  Luôn cập nhật khi thay đổi logic lớn để web/gateway_status theo dõi đúng.
  */
-typedef struct { 
-    const char *ssid; 
-    const char *pass; 
-} wifi_cred_t;
+#define GW_VERSION                 "3.8.3.17-production-wifi-ble"
+#define DEVICE_ID                  "ESP32_LORA_GW"
+#define APP_TIMEZONE_POSIX         "ICT-7"   /* POSIX TZ: ICT-7 = UTC+7 */
 
-static const wifi_cred_t s_wifi_list[] = {
-    {"Truong Lung",   "12345678"},
-    {"LUCAS",         "12345678"},
-    {"Phòng toàn trai đẹp", "aicungdeptrai<3"}
-};
-static const int NUM_WIFIS = sizeof(s_wifi_list) / sizeof(s_wifi_list[0]);
-static int           s_wifi_idx       = 0;
-static TimerHandle_t s_wifi_timer     = NULL;
-static bool          s_wifi_connected = false;
+/**
+ * @brief BLE WiFi Provisioning.
+ *
+ * Lần đầu boot hoặc chưa có credential trong NVS:
+ *   - Gateway quảng bá BLE với tên WSN-GW-xxxxxx.
+ *   - Dùng app ESP BLE Provisioning để quét, chọn WiFi, nhập password.
+ *   - Credential được lưu vào NVS của WiFi driver.
+ */
+#define WIFI_PROV_POP              "duck27005"
+#define WIFI_PROV_SERVICE_PREFIX   "WSN-GW"
+#define WIFI_PROV_WAIT_MS          (0UL)      /* 0 = production: BLE provisioning chờ vô hạn, không timeout */
+#define WIFI_MAX_RETRY             5
+
+/* Production: không dùng hardcoded fallback. Nếu WiFi sai/mất NVS -> giữ BLE để nhập lại. */
+#define APP_ENABLE_HARDCODED_WIFI_FALLBACK  0
+
+static int  s_wifi_retry_count = 0;
+static bool s_wifi_using_fallback = false;
+static bool s_ble_prov_active = false;
+static bool s_wifi_connect_allowed = false;
+static bool s_wifi_connected = false;
+static bool s_prov_mgr_ready = false;
+static bool s_mqtt_enabled = false;
+static bool s_mqtt_connected = false;
+static char s_mqtt_broker[96] = "";
+static char s_ip_addr[20] = "0.0.0.0";
 static EventGroupHandle_t s_wifi_event_group = NULL;
-#define WIFI_CONNECTED_BIT    BIT0
 
-/** @defgroup Supabase Cấu hình API Supabase */
+#define WIFI_CONNECTED_BIT         BIT0
+#define WIFI_FAIL_BIT              BIT1
+
+/** @defgroup Supabase Cấu hình Supabase / Edge Function */
 #define SUPABASE_URL      "https://hbuluhjjfivezrrxesaz.supabase.co"
-#define SUPABASE_TABLE    "weather_logs"
+#define EDGE_FUNCTION_URL "https://hbuluhjjfivezrrxesaz.supabase.co/functions/v1/ingest-weather"
+
+/*
+ * Token này phải giống Supabase Secret: INGEST_DEVICE_TOKEN.
+ * Không dùng service_role key trong firmware.
+ */
+#define INGEST_DEVICE_TOKEN "CHANGE_THIS_LONG_RANDOM_DEVICE_TOKEN"
+
+/* Chỉ dùng anon key cho SELECT OTA config. Không dùng để INSERT weather_logs. */
 #define SUPABASE_ANON_KEY \
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." \
     "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhidWx1" \
     "aGpqZml2ZXpycnhlc2F6Iiwicm9sZSI6ImFub24i" \
     "LCJpYXQiOjE3Nzg1MDE4MDksImV4cCI6MjA5NDA3" \
     "NzgwOX0.KhjB0T-8Yy34P3p37XipEutwVfraabsG274NL_88J4Q"
-#define DEVICE_ID         "ESP32_LORA_GW"
 
-#define HTTP_POST_TIMEOUT_MS    8000
-#define HTTP_GET_TIMEOUT_MS    10000
-#define HTTP_OTA_TIMEOUT_MS    60000
+#define HTTP_POST_TIMEOUT_MS       10000
+#define HTTP_GET_TIMEOUT_MS        10000
+#define HTTP_OTA_TIMEOUT_MS        60000
+#define GATEWAY_STATUS_PERIOD_MS   60000
+
+/*
+ * OTA fast-check:
+ * - Không đợi 45 giây như bản cũ.
+ * - ESP32 kiểm tra device_configs mỗi 5 giây sau khi WiFi/NTP sẵn sàng.
+ * - Quá trình OTA dùng esp_https_ota_begin/perform/finish để có thể yield,
+ *   tránh Task Watchdog khi ghi flash lâu.
+ */
+#define OTA_BOOT_DELAY_MS          3000
+#define OTA_CHECK_PERIOD_MS        5000
+#define OTA_FAIL_BACKOFF_MS        30000
+#define OTA_URL_MAX_LEN            512
+#define OTA_HTTP_RX_BUFFER_SIZE    8192
+#define OTA_HTTP_TX_BUFFER_SIZE    2048
+#define SHA256_HEX_LEN             64
+static char s_running_sha256_hex[SHA256_HEX_LEN + 1] = {0};
+static volatile bool s_ota_in_progress = false;
+static volatile int s_http_in_flight = 0;
+static portMUX_TYPE s_http_ota_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* @brief Nhúng Root CA trực tiếp để bảo mật TLS khi gọi HTTPS */
 extern const char supabase_root_ca_pem_start[] asm("_binary_supabase_root_ca_pem_start");
@@ -145,6 +219,15 @@ extern const char supabase_root_ca_pem_end[]   asm("_binary_supabase_root_ca_pem
 static const uint8_t ASCON_SECRET_KEY[16] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+/**
+ * @brief Khóa ASCON key2 dùng riêng cho ESP32 -> Edge Function.
+ * @note  Supabase Secret phải là ASCON_KEY2_HEX=668ab13302c94de19f7021a85cd47710
+ */
+static const uint8_t ASCON_CLOUD_KEY2[16] = {
+    0x66, 0x8A, 0xB1, 0x33, 0x02, 0xC9, 0x4D, 0xE1,
+    0x9F, 0x70, 0x21, 0xA8, 0x5C, 0xD4, 0x77, 0x10
 };
 
 /** @defgroup Sensor_Flags Cờ báo lỗi phần cứng cảm biến */
@@ -174,6 +257,9 @@ typedef struct {
     float    air_pressure_hpa;
     float    board_temp_c;      
     float    battery_volt;
+    float    predicted_temp_2h;
+    bool     predicted_ok;
+    uint8_t  plaintext[SENSOR_PLAINTEXT_LEN];
     uint8_t  health_flag;       
     bool     sht30_ok;
     bool     bmp388_ok;
@@ -194,10 +280,14 @@ typedef struct {
     float temperature;
 } AI_DataPoint_t;
 
-static QueueHandle_t s_ai_data_queue = NULL;      /**< Hàng đợi nạp data cho Task AI */
 static QueueHandle_t s_supabase_queue = NULL;     /**< Hàng đợi nạp data chờ gửi lên Cloud */
 
 static float g_mlr_predicted_temp_2h = 0.0f;      /**< Lưu trữ kết quả dự báo nhiệt độ 2 giờ tới */
+
+#if LORA_ENABLE_RAM_REPLAY_CHECK
+static uint32_t s_last_frame_counter = 0;
+static bool s_have_last_frame_counter = false;
+#endif
 
 /* ==============================================================================
  * 5. CÁC HÀM TIỆN ÍCH (UTILITIES)
@@ -220,6 +310,57 @@ static int64_t now_ms(void) {
     return esp_timer_get_time() / 1000LL; 
 }
 
+static bool app_time_is_valid(void) {
+    time_t now = 0;
+    struct tm t = {0};
+
+    time(&now);
+    localtime_r(&now, &t);
+
+    return t.tm_year >= (2023 - 1900);
+}
+
+static bool http_try_begin(const char *log_tag) {
+    bool allow = false;
+
+    portENTER_CRITICAL(&s_http_ota_mux);
+    if (!s_ota_in_progress) {
+        s_http_in_flight++;
+        allow = true;
+    }
+    portEXIT_CRITICAL(&s_http_ota_mux);
+
+    if (!allow) {
+        ESP_LOGW(TAG, "[%s] Skip POST vì OTA đang chạy.", log_tag);
+    }
+
+    return allow;
+}
+
+static void http_end(void) {
+    portENTER_CRITICAL(&s_http_ota_mux);
+    if (s_http_in_flight > 0) {
+        s_http_in_flight--;
+    }
+    portEXIT_CRITICAL(&s_http_ota_mux);
+}
+
+static int http_in_flight_get(void) {
+    int n = 0;
+
+    portENTER_CRITICAL(&s_http_ota_mux);
+    n = s_http_in_flight;
+    portEXIT_CRITICAL(&s_http_ota_mux);
+
+    return n;
+}
+
+static void ota_set_in_progress(bool in_progress) {
+    portENTER_CRITICAL(&s_http_ota_mux);
+    s_ota_in_progress = in_progress;
+    portEXIT_CRITICAL(&s_http_ota_mux);
+}
+
 /**
  * @brief Chuyển đổi giá trị ADC thô (0-255) thành điện áp thực (Volts).
  * @param raw Giá trị ADC thô đo từ pin.
@@ -229,151 +370,341 @@ static inline float battery_raw_to_volt(uint8_t raw) {
     return 3.0f + ((float)raw / 255.0f) * (4.2f - 3.0f);
 }
 
-/* ==============================================================================
- * 6. NHIỆM VỤ AI BIÊN (EDGE AI TASK)
- * ============================================================================== */
+static void build_nonce_from_counter(uint32_t c, uint8_t n[16]);
 
-/**
- * @brief Task xử lý AI trên vi điều khiển (Core 1).
- * @details Nhận dữ liệu cảm biến từ Queue, gọi C++ MLR Engine để dự báo nhiệt độ 2 giờ tới.
- * Toàn bộ logic hệ số và ngữ cảnh Ngày/Đêm được đóng gói trong mlr_engine.cpp.
- * @param pvParameters Tham số truyền vào Task (không dùng).
- */
-static void ai_task(void *pvParameters) {
-    ESP_LOGI(TAG, "[AI_ENGINE] Core %d khởi động.", xPortGetCoreID());
-    mlr_engine_init();
-
-    while (1) {
-        AI_DataPoint_t dp;
-        // Task ngủ chờ dữ liệu (giải phóng CPU)
-        if (xQueueReceive(s_ai_data_queue, &dp, portMAX_DELAY) == pdPASS) {
-
-            // Lấy giờ thực tế (đã đồng bộ qua NTP) để MLR Engine chọn ngữ cảnh Ngày/Đêm
-            time_t now;
-            struct tm timeinfo;
-            time(&now);
-            localtime_r(&now, &timeinfo);
-
-            // Suy luận (Inference): Gọi C++ MLR Engine dự báo nhiệt độ 2 giờ tới
-            g_mlr_predicted_temp_2h = mlr_engine_predict_2h(
-                dp.temperature, dp.humidity, dp.pressure, timeinfo.tm_hour
-            );
-
-            ESP_LOGI(TAG, "[AI_ENGINE] Giờ: %d -> Dự báo nhiệt độ 2h tới: %.2f°C",
-                     timeinfo.tm_hour, g_mlr_predicted_temp_2h);
-        }
-    }
+static void app_set_timezone_utc7(void) {
+    setenv("TZ", APP_TIMEZONE_POSIX, 1);
+    tzset();
 }
+
+static void app_log_time_now(const char *prefix) {
+    time_t now = 0;
+    struct tm utc = {0};
+    struct tm local = {0};
+
+    time(&now);
+    gmtime_r(&now, &utc);
+    localtime_r(&now, &local);
+
+    ESP_LOGI(TAG,
+             "%s UTC=%04d-%02d-%02d %02d:%02d:%02d | LOCAL=%04d-%02d-%02d %02d:%02d:%02d | hour=%d doy=%d TZ=%s",
+             prefix,
+             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec,
+             local.tm_year + 1900, local.tm_mon + 1, local.tm_mday, local.tm_hour, local.tm_min, local.tm_sec,
+             local.tm_hour, local.tm_yday + 1, APP_TIMEZONE_POSIX);
+}
+
+static int app_get_wifi_rssi(void) {
+    wifi_ap_record_t ap = {0};
+    if (s_wifi_connected && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        return ap.rssi;
+    }
+    return 0;
+}
+
+static void bytes_to_hex(const uint8_t *in, size_t len, char *out, size_t out_len) {
+    static const char hex[] = "0123456789abcdef";
+    if (out_len < (len * 2 + 1)) {
+        if (out_len > 0) out[0] = '\0';
+        return;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        out[i * 2]     = hex[(in[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = hex[in[i] & 0x0F];
+    }
+    out[len * 2] = '\0';
+}
+
+static float app_predict_temp_2h(float temperature, float humidity, float pressure) {
+    time_t now = 0;
+    struct tm timeinfo = {0};
+
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    int local_hour = timeinfo.tm_hour;
+    int day_of_year = timeinfo.tm_yday + 1;
+
+    float pred = mlr_engine_predict_2h(
+        temperature,
+        humidity,
+        pressure,
+        local_hour,
+        day_of_year
+    );
+
+    ESP_LOGI(TAG,
+             "[MLR_TIME] local=%04d-%02d-%02d %02d:%02d:%02d | hour=%d doy=%d | pred=%.2f°C",
+             timeinfo.tm_year + 1900,
+             timeinfo.tm_mon + 1,
+             timeinfo.tm_mday,
+             timeinfo.tm_hour,
+             timeinfo.tm_min,
+             timeinfo.tm_sec,
+             local_hour,
+             day_of_year,
+             pred);
+
+    return pred;
+}
+
+/* ==============================================================================
+ * 6. MLR FORECAST
+ * ==============================================================================
+ * v3.8.3.15:
+ * - Không dùng AI task riêng nữa.
+ * - MLR được tính đồng bộ ngay khi nhận LoRa frame trong process_frame().
+ * - Giữ nguyên app_predict_temp_2h().
+ */
 
 /* ==============================================================================
  * 7. NHIỆM VỤ ĐÁM MÂY VÀ GIAO TIẾP MẠNG (CLOUD & NETWORKING)
  * ============================================================================== */
 
 /**
- * @brief Hàm đóng gói JSON và thực hiện HTTP POST lên bảng dữ liệu Supabase.
- * @param d Con trỏ chứa dữ liệu đã giải mã từ cảm biến.
+ * @brief POST JSON lên Supabase Edge Function ingest-weather.
+ * @note  Không dùng anon INSERT. Edge Function dùng service_role để ghi DB.
  */
-static void supabase_post_sensor(const SensorDecodedData_t *d) {
-    if (!s_wifi_connected) return;
-
-    /*
-     * Dữ liệu lỗi nên gửi null thay vì 0.0 để database không hiểu nhầm là giá trị thật.
-     * Supabase/PostgREST chấp nhận number/null trong JSON.
-     */
-    char temp_str[24], hum_str[24], press_str[24], bat_str[24];
-    if (d->sht30_ok) {
-        snprintf(temp_str, sizeof(temp_str), "%.2f", d->env_temp_c);
-        snprintf(hum_str,  sizeof(hum_str),  "%.2f", d->env_humidity_pct);
-    } else {
-        strcpy(temp_str, "null");
-        strcpy(hum_str,  "null");
+static esp_err_t edge_post_json(const char *json_body, const char *log_tag) {
+    if (!s_wifi_connected) {
+        ESP_LOGW(TAG, "[%s] Bỏ qua POST vì WiFi chưa connected.", log_tag);
+        return ESP_ERR_WIFI_NOT_CONNECT;
     }
 
-    if (d->bmp388_ok) {
-        snprintf(press_str, sizeof(press_str), "%.2f", d->air_pressure_hpa);
-    } else {
-        strcpy(press_str, "null");
+    if (!http_try_begin(log_tag)) {
+        return ESP_ERR_INVALID_STATE;
     }
-
-    if (d->ina219_ok) {
-        snprintf(bat_str, sizeof(bat_str), "%.3f", d->battery_volt);
-    } else {
-        strcpy(bat_str, "null");
-    }
-
-    // Đóng gói JSON Payload
-    char body[512];
-    int body_len = snprintf(body, sizeof(body),
-        "{"
-        "\"frame_counter\":%"PRIu32","
-        "\"temperature\":%s,"
-        "\"humidity\":%s,"
-        "\"pressure\":%s,"
-        "\"board_temp\":%.2f,"
-        "\"battery\":%s,"
-        "\"predicted_temp_2h\":%.2f,"
-        "\"device_id\":\"%s\""
-        "}",
-        d->frame_counter,
-        temp_str,
-        hum_str,
-        press_str,
-        d->board_temp_c,
-        bat_str,
-        g_mlr_predicted_temp_2h,
-        DEVICE_ID
-    );
-
-    ESP_LOGI(TAG, "[SUPABASE] Chuẩn bị POST: %s", body);
-
-    char url[160];
-    snprintf(url, sizeof(url), "%s/rest/v1/%s", SUPABASE_URL, SUPABASE_TABLE);
 
     esp_http_client_config_t http_cfg = {
-        .url               = url,
+        .url               = EDGE_FUNCTION_URL,
         .method            = HTTP_METHOD_POST,
         .timeout_ms        = HTTP_POST_TIMEOUT_MS,
         .buffer_size       = 4096,
         .buffer_size_tx    = 2048,
-        .keep_alive_enable = true, // Giữ kết nối TCP để POST nhanh hơn ở lần sau
+        .keep_alive_enable = true,
     };
-    tls_cfg_fill(&http_cfg); 
+    tls_cfg_fill(&http_cfg);
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
-    if (!client) { ESP_LOGE(TAG, "[SUPABASE] Khởi tạo HTTP Client thất bại."); return; }
+    if (!client) {
+        ESP_LOGE(TAG, "[%s] Khởi tạo HTTP client thất bại.", log_tag);
+        http_end();
+        return ESP_FAIL;
+    }
 
-    esp_http_client_set_header(client, "Content-Type",  "application/json");
-    esp_http_client_set_header(client, "apikey",        SUPABASE_ANON_KEY);
-    esp_http_client_set_header(client, "Authorization", "Bearer " SUPABASE_ANON_KEY);
-    esp_http_client_set_header(client, "Prefer",        "return=minimal"); // Tối ưu băng thông trả về
-    esp_http_client_set_post_field(client, body, body_len);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "x-device-token", INGEST_DEVICE_TOKEN);
+    esp_http_client_set_post_field(client, json_body, strlen(json_body));
 
     esp_err_t err = esp_http_client_perform(client);
-    if (err == ESP_OK) {
-        int st = esp_http_client_get_status_code(client);
-        if (st == 201 || st == 200)
-            ESP_LOGI(TAG, "[SUPABASE] ✅ HTTP %d - Đã lưu dữ liệu.", st);
-        else
-            ESP_LOGW(TAG, "[SUPABASE] ⚠ HTTP %d — Kiểm tra quyền RLS trên Supabase.", st);
+    int status = esp_http_client_get_status_code(client);
+
+    if (err == ESP_OK && status >= 200 && status < 300) {
+        ESP_LOGI(TAG, "[%s] ✅ Edge HTTP %d", log_tag, status);
+    } else if (err == ESP_OK) {
+        ESP_LOGW(TAG, "[%s] ⚠ Edge HTTP %d. Kiểm tra Edge logs / token / schema.", log_tag, status);
     } else {
-        ESP_LOGE(TAG, "[SUPABASE] ❌ Lỗi mạng: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "[%s] ❌ Edge POST lỗi: %s", log_tag, esp_err_to_name(err));
     }
+
     esp_http_client_cleanup(client);
+    http_end();
+    return err;
+}
+
+
+static bool is_valid_sha256_hex(const char *s) {
+    if (!s || strlen(s) != SHA256_HEX_LEN) return false;
+    for (size_t i = 0; i < SHA256_HEX_LEN; ++i) {
+        char c = s[i];
+        bool ok = (c >= '0' && c <= '9') ||
+                  (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F');
+        if (!ok) return false;
+    }
+    return true;
 }
 
 /**
- * @brief Task xử lý Hàng đợi Cloud (Mô hình Consumer).
- * @details Cách ly quá trình kết nối mạng (chặn luồng/blocking) khỏi quá trình bắt sóng vô tuyến.
- * @param pvParameters Tham số truyền vào Task.
+ * @brief Tính SHA256 của app partition đang chạy.
+ * @details Dùng để phân biệt firmware cũ/mới ổn định hơn ota_url hoặc version string.
  */
-static void supabase_task(void *pvParameters) {
+static esp_err_t app_update_running_sha256_cache(void) {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running) {
+        ESP_LOGW(TAG, "[APP_HASH] Không lấy được running partition.");
+        return ESP_FAIL;
+    }
+
+    uint8_t sha[32] = {0};
+    esp_err_t err = esp_partition_get_sha256(running, sha);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "[APP_HASH] esp_partition_get_sha256 failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    bytes_to_hex(sha, sizeof(sha), s_running_sha256_hex, sizeof(s_running_sha256_hex));
+    ESP_LOGI(TAG, "[APP_HASH] running_partition=%s sha256=%s",
+             running->label ? running->label : "unknown",
+             s_running_sha256_hex);
+    return ESP_OK;
+}
+
+static const char *app_get_running_sha256_hex(void) {
+    if (s_running_sha256_hex[0] == '\0') {
+        (void)app_update_running_sha256_cache();
+    }
+    return s_running_sha256_hex;
+}
+
+/**
+ * @brief Mã hóa plaintext sensor bằng ASCON key2 để gửi lên Edge Function.
+ * @details v3.8.3.14 dùng full tag 16 byte cho cloud:
+ *          payload_key2 = ciphertext 10 byte + tag16 16 byte = 26 byte = 52 hex.
+ * @note  Tag dài hơn không làm ciphertext "khó giải mã" hơn, nhưng tăng mạnh
+ *        khả năng chống giả mạo/sửa gói hợp lệ.
+ */
+static bool build_payload_key2_hex(const SensorDecodedData_t *d, char out_hex[ASCON_CLOUD_HEX_LEN + 1]) {
+    uint8_t nonce[16];
+    build_nonce_from_counter(d->frame_counter, nonce);
+
+    uint8_t ct_full[ASCON_CLOUD_INPUT_LEN] = {0};
+    unsigned long long clen = 0ULL;
+
+    if (crypto_aead_encrypt(ct_full, &clen,
+                            d->plaintext, SENSOR_PLAINTEXT_LEN,
+                            NULL, 0, NULL, nonce, ASCON_CLOUD_KEY2) != 0) {
+        ESP_LOGE(TAG, "[EDGE_SENSOR] ASCON key2 encrypt failed");
+        return false;
+    }
+
+    if (clen != ASCON_CLOUD_INPUT_LEN) {
+        ESP_LOGE(TAG, "[EDGE_SENSOR] ASCON key2 output length invalid: %llu, expected=%d",
+                 clen, ASCON_CLOUD_INPUT_LEN);
+        return false;
+    }
+
+    bytes_to_hex(ct_full, ASCON_CLOUD_INPUT_LEN, out_hex, ASCON_CLOUD_HEX_LEN + 1);
+    return true;
+}
+
+/**
+ * @brief Đóng gói sensor packet và POST lên Edge Function.
+ */
+static void edge_post_sensor(const SensorDecodedData_t *d) {
+    if (s_ota_in_progress) {
+        ESP_LOGW(TAG, "[EDGE_SENSOR] Skip POST vì OTA đang chạy.");
+        return;
+    }
+    char payload_key2_hex[ASCON_CLOUD_HEX_LEN + 1] = {0};
+    if (!build_payload_key2_hex(d, payload_key2_hex)) return;
+
+    char pred_str[24];
+    if (d->predicted_ok) snprintf(pred_str, sizeof(pred_str), "%.2f", d->predicted_temp_2h);
+    else strcpy(pred_str, "null");
+
+    char body[1050];
+    snprintf(body, sizeof(body),
+        "{"
+        "\"type\":\"sensor\","
+        "\"device_id\":\"%s\","
+        "\"firmware_version\":\"%s\","
+        "\"firmware_sha256\":\"%s\","
+        "\"frame_counter\":%"PRIu32","
+        "\"payload_key2\":\"%s\","
+        "\"predicted_temp_2h\":%s,"
+        "\"model_version\":\"mlr_baseline_v1_1_hour_bias\","
+        "\"model_source\":\"openmeteo_baseline_utc7\","
+        "\"wifi_rssi\":%d,"
+        "\"mqtt_enabled\":%s,"
+        "\"mqtt_connected\":%s,"
+        "\"mqtt_broker\":\"%s\","
+        "\"ip_address\":\"%s\","
+        "\"uptime_sec\":%lld,"
+        "\"free_heap\":%lu"
+        "}",
+        DEVICE_ID,
+        GW_VERSION,
+        app_get_running_sha256_hex(),
+        d->frame_counter,
+        payload_key2_hex,
+        pred_str,
+        app_get_wifi_rssi(),
+        s_mqtt_enabled ? "true" : "false",
+        s_mqtt_connected ? "true" : "false",
+        s_mqtt_broker,
+        s_ip_addr,
+        (long long)(esp_timer_get_time() / 1000000LL),
+        (unsigned long)esp_get_free_heap_size()
+    );
+
+    ESP_LOGI(TAG, "[EDGE_SENSOR] POST frame=%"PRIu32" payload_key2(tag16)=%s", d->frame_counter, payload_key2_hex);
+    edge_post_json(body, "EDGE_SENSOR");
+}
+
+/**
+ * @brief Task Consumer: gửi sensor packet từ queue lên Edge Function.
+ */
+static void edge_task(void *pvParameters) {
+    (void)pvParameters;
     SensorDecodedData_t data_to_post;
 
     while (1) {
-        // Lấy dữ liệu từ hàng đợi, block vô hạn nếu hàng đợi trống
         if (xQueueReceive(s_supabase_queue, &data_to_post, portMAX_DELAY) == pdPASS) {
-            supabase_post_sensor(&data_to_post);
+            edge_post_sensor(&data_to_post);
         }
+    }
+}
+
+/**
+ * @brief Heartbeat riêng của ESP32 gateway để web biết gateway còn sống.
+ * @note  Không phụ thuộc STM32 có gửi LoRa hay không.
+ */
+static void gateway_status_task(void *pvParameters) {
+    (void)pvParameters;
+
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    while (1) {
+        if (s_ota_in_progress) {
+            ESP_LOGW(TAG, "[GW_STATUS] Skip heartbeat vì OTA đang chạy.");
+            vTaskDelay(pdMS_TO_TICKS(GATEWAY_STATUS_PERIOD_MS));
+            continue;
+        }
+
+        if (s_wifi_connected) {
+            char body[850];
+            snprintf(body, sizeof(body),
+                "{"
+                "\"type\":\"gateway_status\","
+                "\"device_id\":\"%s\","
+                "\"firmware_version\":\"%s\","
+                "\"firmware_sha256\":\"%s\","
+                "\"wifi_rssi\":%d,"
+                "\"mqtt_enabled\":%s,"
+                "\"mqtt_connected\":%s,"
+                "\"mqtt_broker\":\"%s\","
+                "\"ip_address\":\"%s\","
+                "\"uptime_sec\":%lld,"
+                "\"free_heap\":%lu,"
+                "\"status_note\":\"gateway heartbeat\""
+                "}",
+                DEVICE_ID,
+                GW_VERSION,
+                app_get_running_sha256_hex(),
+                app_get_wifi_rssi(),
+                s_mqtt_enabled ? "true" : "false",
+                s_mqtt_connected ? "true" : "false",
+                s_mqtt_broker,
+                s_ip_addr,
+                (long long)(esp_timer_get_time() / 1000000LL),
+                (unsigned long)esp_get_free_heap_size()
+            );
+
+            edge_post_json(body, "GW_STATUS");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(GATEWAY_STATUS_PERIOD_MS));
     }
 }
 
@@ -387,17 +718,30 @@ static void supabase_task(void *pvParameters) {
  * @param max_len Kích thước buffer.
  * @return esp_err_t ESP_OK nếu lấy được URL hợp lệ, ngược lại trả về lỗi.
  */
-static esp_err_t fetch_supabase_ota_url(char *out_url, size_t max_len) {
-    char url[256];
+typedef struct {
+    char    ota_url[OTA_URL_MAX_LEN];
+    char    ota_sha256[SHA256_HEX_LEN + 1];
+    int64_t ota_seq;
+    bool    has_ota_seq;
+    bool    has_ota_sha256;
+} ota_config_t;
+
+static esp_err_t fetch_supabase_ota_config_select(const char *select_fields, ota_config_t *out_cfg) {
+    if (!out_cfg || !select_fields) return ESP_ERR_INVALID_ARG;
+    memset(out_cfg, 0, sizeof(*out_cfg));
+    out_cfg->ota_seq = -1;
+
+    char url[320];
     snprintf(url, sizeof(url),
-             "%s/rest/v1/device_configs?device_id=eq.%s&select=ota_url",
-             SUPABASE_URL, DEVICE_ID);
+             "%s/rest/v1/device_configs?device_id=eq.%s&select=%s&limit=1",
+             SUPABASE_URL, DEVICE_ID, select_fields);
 
     esp_http_client_config_t http_cfg = {
         .url            = url,
         .method         = HTTP_METHOD_GET,
         .timeout_ms     = HTTP_GET_TIMEOUT_MS,
         .buffer_size    = 4096,
+        .buffer_size_tx = 1024,
     };
     tls_cfg_fill(&http_cfg);
 
@@ -407,100 +751,323 @@ static esp_err_t fetch_supabase_ota_url(char *out_url, size_t max_len) {
     esp_http_client_set_header(client, "apikey",        SUPABASE_ANON_KEY);
     esp_http_client_set_header(client, "Authorization", "Bearer " SUPABASE_ANON_KEY);
 
-    if (esp_http_client_open(client, 0) != ESP_OK) {
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
         esp_http_client_cleanup(client);
-        return ESP_FAIL;
+        return err;
     }
 
     int content_length = esp_http_client_fetch_headers(client);
-    if (content_length <= 0) content_length = 2048;
+    int status = esp_http_client_get_status_code(client);
+    if (content_length <= 0 || content_length > 2048) content_length = 2048;
 
-    char *buf = malloc(content_length + 1);
-    if (!buf) { esp_http_client_cleanup(client); return ESP_ERR_NO_MEM; }
+    char *buf = calloc(1, content_length + 1);
+    if (!buf) {
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NO_MEM;
+    }
 
     int read_len = esp_http_client_read(client, buf, content_length);
     esp_http_client_cleanup(client);
 
-    if (read_len <= 0) { free(buf); return ESP_FAIL; }
+    if (status < 200 || status >= 300 || read_len <= 0) {
+        ESP_LOGW(TAG, "[OTA_ENGINE] GET config fail HTTP=%d select=%s body=%.*s",
+                 status, select_fields, read_len > 0 ? read_len : 0, buf);
+        free(buf);
+        return ESP_FAIL;
+    }
+
     buf[read_len] = '\0';
 
     cJSON *root = cJSON_Parse(buf);
     free(buf);
     if (!root) return ESP_FAIL;
 
-    esp_err_t result = ESP_FAIL;
+    esp_err_t result = ESP_ERR_NOT_FOUND;
     if (cJSON_IsArray(root) && cJSON_GetArraySize(root) > 0) {
-        cJSON *item    = cJSON_GetArrayItem(root, 0);
+        cJSON *item = cJSON_GetArrayItem(root, 0);
+
         cJSON *url_obj = cJSON_GetObjectItemCaseSensitive(item, "ota_url");
-        if (cJSON_IsString(url_obj) && url_obj->valuestring) {
-            strncpy(out_url, url_obj->valuestring, max_len - 1);
-            out_url[max_len - 1] = '\0';
+        if (cJSON_IsString(url_obj) && url_obj->valuestring && url_obj->valuestring[0] != '\0') {
+            strncpy(out_cfg->ota_url, url_obj->valuestring, sizeof(out_cfg->ota_url) - 1);
             result = ESP_OK;
         }
+
+        cJSON *sha_obj = cJSON_GetObjectItemCaseSensitive(item, "ota_sha256");
+        if (cJSON_IsString(sha_obj) && sha_obj->valuestring && is_valid_sha256_hex(sha_obj->valuestring)) {
+            strncpy(out_cfg->ota_sha256, sha_obj->valuestring, sizeof(out_cfg->ota_sha256) - 1);
+            out_cfg->has_ota_sha256 = true;
+        }
+
+        cJSON *seq_obj = cJSON_GetObjectItemCaseSensitive(item, "ota_seq");
+        if (cJSON_IsNumber(seq_obj)) {
+            out_cfg->ota_seq = (int64_t)seq_obj->valuedouble;
+            out_cfg->has_ota_seq = true;
+        }
     }
+
     cJSON_Delete(root);
     return result;
 }
 
 /**
- * @brief Task chạy ngầm kiểm tra và thực thi OTA mỗi 30 phút.
- * @param pvParameters Tham số truyền vào Task.
+ * @brief Lấy OTA config từ Supabase.
+ * @note  Ưu tiên schema mới ota_url,ota_seq. Nếu DB chưa có ota_seq thì fallback ota_url.
  */
-static void ota_task(void *pvParameters) {
-    vTaskDelay(pdMS_TO_TICKS(45000)); // Đợi 45 giây lúc khởi động để ưu tiên các Task khác
+static esp_err_t fetch_supabase_ota_config(ota_config_t *out_cfg) {
+    esp_err_t err = fetch_supabase_ota_config_select("ota_url,ota_seq,ota_sha256", out_cfg);
+    if (err == ESP_OK) return ESP_OK;
 
-    char dynamic_ota_url[512]  = {0};
-    char last_flashed_url[512] = {0};
+    ota_config_t fallback = {0};
+    err = fetch_supabase_ota_config_select("ota_url,ota_sha256", &fallback);
+    if (err == ESP_OK) {
+        fallback.has_ota_seq = false;
+        fallback.ota_seq = -1;
+        *out_cfg = fallback;
+        return ESP_OK;
+    }
+
+    ota_config_t legacy = {0};
+    err = fetch_supabase_ota_config_select("ota_url", &legacy);
+    if (err == ESP_OK) {
+        legacy.has_ota_seq = false;
+        legacy.has_ota_sha256 = false;
+        legacy.ota_seq = -1;
+        *out_cfg = legacy;
+        return ESP_OK;
+    }
+
+    return err;
+}
+
+static bool ota_is_already_applied(const ota_config_t *cfg) {
+    if (!cfg || cfg->ota_url[0] == '\0') return true;
+
+    /*
+     * Lưu ý quan trọng:
+     * - SHA256 web tính là SHA256 của file .bin gốc.
+     * - esp_partition_get_sha256() trên ESP-IDF trả SHA theo image/partition,
+     *   có thể KHÔNG trùng raw file SHA256 của browser.
+     *
+     * Vì vậy chống OTA lặp phải ưu tiên so với NVS last_sha đã lưu sau OTA thành công.
+     * Nếu spam upload cùng 1 file .bin nhưng URL/ota_seq khác, ota_sha256 vẫn giống last_sha -> skip.
+     */
+    nvs_handle_t nvs_h;
+    char last_sha[SHA256_HEX_LEN + 1] = {0};
+    char last_url[OTA_URL_MAX_LEN] = {0};
+    int64_t last_seq = -1;
+    bool have_last_sha = false;
+    bool have_last_url = false;
+    bool have_last_seq = false;
+
+    if (nvs_open("ota_store", NVS_READWRITE, &nvs_h) == ESP_OK) {
+        size_t sha_sz = sizeof(last_sha);
+        have_last_sha = (nvs_get_str(nvs_h, "last_sha", last_sha, &sha_sz) == ESP_OK);
+
+        size_t url_sz = sizeof(last_url);
+        have_last_url = (nvs_get_str(nvs_h, "last_url", last_url, &url_sz) == ESP_OK);
+
+        have_last_seq = (nvs_get_i64(nvs_h, "last_seq", &last_seq) == ESP_OK);
+        nvs_close(nvs_h);
+    }
+
+    if (cfg->has_ota_seq && have_last_seq && cfg->ota_seq <= last_seq) {
+        ESP_LOGI(TAG, "[OTA_ENGINE] Skip: ota_seq cũ. target=%lld last=%lld",
+                 (long long)cfg->ota_seq, (long long)last_seq);
+        return true;
+    }
+
+    if (cfg->has_ota_sha256 && have_last_sha) {
+        if (strcasecmp(cfg->ota_sha256, last_sha) == 0) {
+            ESP_LOGI(TAG, "[OTA_ENGINE] Skip: ota_sha256 đã apply trong NVS. sha=%s", cfg->ota_sha256);
+            return true;
+        }
+    }
+
+    /*
+     * So running SHA chỉ là phụ trợ. Không dùng mismatch running-vs-browser để ép OTA,
+     * vì hai loại SHA có thể khác hệ quy chiếu.
+     */
+    if (cfg->has_ota_sha256) {
+        const char *running_sha = app_get_running_sha256_hex();
+        if (running_sha && running_sha[0] != '\0' && strcasecmp(cfg->ota_sha256, running_sha) == 0) {
+            ESP_LOGI(TAG, "[OTA_ENGINE] Skip: ota_sha256 trùng running partition sha256.");
+            return true;
+        }
+    }
+
+    if (!cfg->has_ota_sha256 && have_last_url && strcmp(cfg->ota_url, last_url) == 0) {
+        ESP_LOGI(TAG, "[OTA_ENGINE] Skip: ota_url đã apply.");
+        return true;
+    }
+
+    if (cfg->has_ota_sha256) {
+        ESP_LOGI(TAG, "[OTA_ENGINE] Cần OTA: target raw-bin sha256=%s last_sha=%s running_partition_sha=%s",
+                 cfg->ota_sha256,
+                 have_last_sha ? last_sha : "none",
+                 app_get_running_sha256_hex());
+    }
+
+    return false;
+}
+
+static void ota_mark_applied(const ota_config_t *cfg) {
+    if (!cfg) return;
+
+    nvs_handle_t nvs_h;
+    if (nvs_open("ota_store", NVS_READWRITE, &nvs_h) == ESP_OK) {
+        nvs_set_str(nvs_h, "last_url", cfg->ota_url);
+        if (cfg->has_ota_seq) {
+            nvs_set_i64(nvs_h, "last_seq", cfg->ota_seq);
+        }
+        if (cfg->has_ota_sha256) {
+            nvs_set_str(nvs_h, "last_sha", cfg->ota_sha256);
+        }
+        nvs_commit(nvs_h);
+        nvs_close(nvs_h);
+    }
+}
+
+/**
+ * @brief OTA non-blocking style: begin/perform/finish, có yield để tránh Task WDT.
+ */
+static esp_err_t ota_perform_url_iterative(const char *ota_url) {
+    if (!ota_url || ota_url[0] == '\0') return ESP_ERR_INVALID_ARG;
+
+    esp_http_client_config_t ota_http_cfg = {
+        .url               = ota_url,
+        .timeout_ms        = HTTP_OTA_TIMEOUT_MS,
+        .buffer_size       = OTA_HTTP_RX_BUFFER_SIZE,
+        .buffer_size_tx    = OTA_HTTP_TX_BUFFER_SIZE,
+        .keep_alive_enable = true,
+    };
+    tls_cfg_fill(&ota_http_cfg);
+
+    esp_https_ota_config_t ota_cfg = {
+        .http_config = &ota_http_cfg,
+    };
+
+    esp_https_ota_handle_t ota_handle = NULL;
+
+    /* Không add OTA_TASK vào Task WDT: esp_https_ota_begin/flash write có thể block lâu hơn timeout.
+     * Vẫn yield trong perform loop để IDLE task chạy, tránh WDT hệ thống. */
+
+    esp_err_t err = esp_https_ota_begin(&ota_cfg, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[OTA_ENGINE] esp_https_ota_begin failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    int64_t last_log_ms = now_ms();
 
     while (1) {
-        if (s_wifi_connected) {
-            if (fetch_supabase_ota_url(dynamic_ota_url, sizeof(dynamic_ota_url)) == ESP_OK) {
-                
-                bool is_old = false;
-                nvs_handle_t nvs_h;
-                // Kiểm tra xem URL này đã từng được flash chưa (tránh flash lặp lại liên tục)
-                if (nvs_open("ota_store", NVS_READWRITE, &nvs_h) == ESP_OK) {
-                    size_t sz = sizeof(last_flashed_url);
-                    if (nvs_get_str(nvs_h, "last_url", last_flashed_url, &sz) == ESP_OK)
-                        is_old = (strcmp(dynamic_ota_url, last_flashed_url) == 0);
-                    nvs_close(nvs_h);
+        err = esp_https_ota_perform(ota_handle);
+
+        /* OTA_TASK không đăng ký WDT nên không reset WDT tại đây. */
+
+        /* Cho IDLE task chạy, tránh log task_wdt khi ghi flash lâu. */
+        vTaskDelay(pdMS_TO_TICKS(1));
+
+        if (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            int64_t t = now_ms();
+            if ((t - last_log_ms) > 5000) {
+                ESP_LOGI(TAG, "[OTA_ENGINE] Đang tải/ghi OTA... written=%d bytes",
+                         esp_https_ota_get_image_len_read(ota_handle));
+                last_log_ms = t;
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[OTA_ENGINE] esp_https_ota_perform failed: %s", esp_err_to_name(err));
+        esp_https_ota_abort(ota_handle);
+        return err;
+    }
+
+    if (!esp_https_ota_is_complete_data_received(ota_handle)) {
+        ESP_LOGE(TAG, "[OTA_ENGINE] Firmware download chưa đủ dữ liệu.");
+        esp_https_ota_abort(ota_handle);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    err = esp_https_ota_finish(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[OTA_ENGINE] esp_https_ota_finish failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+/**
+ * @brief OTA fast check.
+ * @details ESP32 kiểm tra device_configs mỗi 5 giây sau khi WiFi/NTP sẵn sàng.
+ *          Đây là gần realtime, không phải chờ 30 phút như bản cũ.
+ */
+static void ota_task(void *pvParameters) {
+    (void)pvParameters;
+
+    vTaskDelay(pdMS_TO_TICKS(OTA_BOOT_DELAY_MS));
+
+    while (1) {
+        if (!s_wifi_connected) {
+            vTaskDelay(pdMS_TO_TICKS(OTA_CHECK_PERIOD_MS));
+            continue;
+        }
+
+        ota_config_t cfg = {0};
+        esp_err_t fetch_err = fetch_supabase_ota_config(&cfg);
+
+        if (fetch_err == ESP_OK && cfg.ota_url[0] != '\0') {
+            if (!ota_is_already_applied(&cfg)) {
+                if (cfg.has_ota_seq) {
+                    ESP_LOGW(TAG, "[OTA_ENGINE] 🚀 Firmware mới: ota_seq=%lld sha256=%s url=%s",
+                             (long long)cfg.ota_seq,
+                             cfg.has_ota_sha256 ? cfg.ota_sha256 : "none",
+                             cfg.ota_url);
+                } else {
+                    ESP_LOGW(TAG, "[OTA_ENGINE] 🚀 Firmware mới: sha256=%s url=%s",
+                             cfg.has_ota_sha256 ? cfg.ota_sha256 : "none",
+                             cfg.ota_url);
                 }
 
-                if (!is_old) {
-                    ESP_LOGW(TAG, "[OTA_ENGINE] 🚀 Phát hiện Firmware mới: %s", dynamic_ota_url);
+                ota_set_in_progress(true);
 
-                    esp_http_client_config_t ota_http_cfg = {
-                        .url               = dynamic_ota_url,
-                        .timeout_ms        = HTTP_OTA_TIMEOUT_MS,
-                        .buffer_size       = 4096,
-                        .keep_alive_enable = true,
-                    };
-                    tls_cfg_fill(&ota_http_cfg);
+                /* Chờ các HTTP POST đang chạy kết thúc để không tranh TLS/CPU với OTA. */
+                int wait_http_ms = 0;
+                int in_flight = http_in_flight_get();
+                while (in_flight > 0 && wait_http_ms < 15000) {
+                    ESP_LOGW(TAG, "[OTA_ENGINE] Chờ HTTP task kết thúc trước OTA... in_flight=%d", in_flight);
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    wait_http_ms += 500;
+                    in_flight = http_in_flight_get();
+                }
 
-                    const esp_https_ota_config_t ota_cfg = { .http_config = &ota_http_cfg };
+                esp_err_t ota_err = ota_perform_url_iterative(cfg.ota_url);
+                if (ota_err == ESP_OK) {
+                    ESP_LOGI(TAG, "[OTA_ENGINE] ✅ Nạp thành công. Lưu lịch sử và khởi động lại...");
+                    ota_mark_applied(&cfg);
 
-                    if (esp_https_ota(&ota_cfg) == ESP_OK) {
-                        ESP_LOGI(TAG, "[OTA_ENGINE] ✅ Nạp thành công. Lưu lịch sử và khởi động lại...");
-                        if (nvs_open("ota_store", NVS_READWRITE, &nvs_h) == ESP_OK) {
-                            nvs_set_str(nvs_h, "last_url", dynamic_ota_url);
-                            nvs_commit(nvs_h);
-                            nvs_close(nvs_h);
-                        }
-                        vTaskDelay(pdMS_TO_TICKS(3000));
-                        esp_restart();
-                    } else {
-                        ESP_LOGE(TAG, "[OTA_ENGINE] ❌ Nạp Firmware thất bại.");
-                    }
+                    vTaskDelay(pdMS_TO_TICKS(1500));
+                    esp_restart();
+                } else {
+                    ota_set_in_progress(false);
+                    ESP_LOGE(TAG, "[OTA_ENGINE] ❌ OTA thất bại: %s. Backoff %d ms.",
+                             esp_err_to_name(ota_err), OTA_FAIL_BACKOFF_MS);
+                    vTaskDelay(pdMS_TO_TICKS(OTA_FAIL_BACKOFF_MS));
                 }
             }
         }
-        // Ngủ 30 phút rồi mới kiểm tra lại
-        vTaskDelay(pdMS_TO_TICKS(30UL * 60UL * 1000UL));
+
+        vTaskDelay(pdMS_TO_TICKS(OTA_CHECK_PERIOD_MS));
     }
 }
 
 /* ==============================================================================
- * 9. KẾT NỐI WIFI (WIFI STATION)
+ * 9. KẾT NỐI WIFI (BLE PROVISIONING PRODUCTION)
  * ============================================================================== */
 
 /**
@@ -515,56 +1082,214 @@ static void app_nvs_init(void) {
     ESP_ERROR_CHECK(ret);
 }
 
-static void wifi_retry_timer_cb(TimerHandle_t xTimer) { 
-    esp_wifi_connect(); 
+static void get_ble_service_name(char *service_name, size_t max_len);
+
+static esp_err_t wifi_prov_mgr_init_if_needed(void) {
+    if (s_prov_mgr_ready) return ESP_OK;
+
+    network_prov_mgr_config_t prov_cfg = {
+        .scheme = network_prov_scheme_ble,
+        .scheme_event_handler = NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE,
+    };
+
+    esp_err_t err = network_prov_mgr_init(prov_cfg);
+    if (err == ESP_OK) {
+        s_prov_mgr_ready = true;
+    }
+    return err;
 }
 
-static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        s_wifi_connected = false;
-        // Chiến thuật vòng lặp: Rớt mạng thì thử mạng tiếp theo trong danh sách
-        s_wifi_idx = (s_wifi_idx + 1) % NUM_WIFIS;
-        ESP_LOGW(TAG, "[WIFI] Mất kết nối. Đang thử mạng: %s", s_wifi_list[s_wifi_idx].ssid);
-        
-        wifi_config_t wcfg = {0};
-        strncpy((char *)wcfg.sta.ssid,     s_wifi_list[s_wifi_idx].ssid, sizeof(wcfg.sta.ssid)     - 1);
-        strncpy((char *)wcfg.sta.password, s_wifi_list[s_wifi_idx].pass, sizeof(wcfg.sta.password) - 1);
-        esp_wifi_set_config(WIFI_IF_STA, &wcfg);
-        
-        xTimerStart(s_wifi_timer, 0); // Thử lại sau 5 giây
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+static void wifi_prov_mgr_deinit_if_ready(void) {
+    if (s_prov_mgr_ready) {
+        network_prov_mgr_deinit();
+        s_prov_mgr_ready = false;
+    }
+}
+
+static esp_err_t wifi_start_ble_provisioning_now(const char *reason, bool clear_old_wifi_credentials) {
+    char service_name[32] = {0};
+    get_ble_service_name(service_name, sizeof(service_name));
+
+    s_ble_prov_active = true;
+    s_wifi_connect_allowed = false;
+    s_wifi_using_fallback = false;
+    s_wifi_retry_count = 0;
+    s_wifi_connected = false;
+    strncpy(s_ip_addr, "0.0.0.0", sizeof(s_ip_addr));
+    if (s_wifi_event_group) {
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    }
+
+    if (clear_old_wifi_credentials) {
+        ESP_LOGW(TAG, "[WIFI] Xóa credential WiFi cũ trong NVS để nhập lại bằng BLE.");
+        esp_wifi_disconnect();
+        esp_wifi_stop();
+        vTaskDelay(pdMS_TO_TICKS(300));
+        ESP_ERROR_CHECK(esp_wifi_restore());
+        ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
+    }
+
+    ESP_ERROR_CHECK(wifi_prov_mgr_init_if_needed());
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    ESP_LOGW(TAG, "[BLE_PROV] %s", reason ? reason : "Bắt đầu BLE provisioning.");
+    ESP_LOGW(TAG, "[BLE_PROV] Device name: %s", service_name);
+    ESP_LOGW(TAG, "[BLE_PROV] PoP: %s", WIFI_PROV_POP);
+    ESP_LOGI(TAG, "[WIFI] Production flow: BLE provisioning chờ vô hạn, nhập sai thì nhập lại, không fallback hardcoded.");
+
+    const char *service_key = NULL; /* BLE không dùng service_key */
+    return network_prov_mgr_start_provisioning(
+        NETWORK_PROV_SECURITY_1,
+        WIFI_PROV_POP,
+        service_name,
+        service_key
+    );
+}
+
+static void get_ble_service_name(char *service_name, size_t max_len) {
+    uint8_t eth_mac[6] = {0};
+    esp_read_mac(eth_mac, ESP_MAC_WIFI_STA);
+    snprintf(service_name, max_len, "%s-%02X%02X%02X",
+             WIFI_PROV_SERVICE_PREFIX, eth_mac[3], eth_mac[4], eth_mac[5]);
+}
+
+static void app_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    (void)arg;
+
+    if (event_base == NETWORK_PROV_EVENT) {
+        switch (event_id) {
+            case NETWORK_PROV_START:
+                s_ble_prov_active = true;
+                s_wifi_connect_allowed = false;
+                s_wifi_using_fallback = false;
+                ESP_LOGI(TAG, "[BLE_PROV] Provisioning started. Dùng app ESP BLE Provisioning để nhập WiFi.");
+                break;
+
+            case NETWORK_PROV_WIFI_CRED_RECV: {
+                wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
+                size_t pass_len = strnlen((const char *)wifi_sta_cfg->password, sizeof(wifi_sta_cfg->password));
+                ESP_LOGI(TAG, "[BLE_PROV] Nhận credential SSID=%s PASS_LEN=%u",
+                         (const char *)wifi_sta_cfg->ssid, (unsigned)pass_len);
+                break;
+            }
+
+            case NETWORK_PROV_WIFI_CRED_FAIL: {
+                network_prov_wifi_sta_fail_reason_t *reason = (network_prov_wifi_sta_fail_reason_t *)event_data;
+                s_ble_prov_active = true;
+                s_wifi_connect_allowed = false;
+                ESP_LOGE(TAG, "[BLE_PROV] Credential fail, reason=%s",
+                         (*reason == NETWORK_PROV_WIFI_STA_AUTH_ERROR) ? "AUTH_ERROR" : "AP_NOT_FOUND");
+                break;
+            }
+
+            case NETWORK_PROV_WIFI_CRED_SUCCESS:
+                s_ble_prov_active = false;
+                s_wifi_connect_allowed = true;
+                s_wifi_using_fallback = false;
+                s_wifi_retry_count = 0;
+                ESP_LOGI(TAG, "[BLE_PROV] ✅ WiFi credential hợp lệ.");
+                break;
+
+            case NETWORK_PROV_END:
+                s_ble_prov_active = false;
+                ESP_LOGI(TAG, "[BLE_PROV] End. Deinit provisioning manager để giải phóng BLE RAM.");
+                wifi_prov_mgr_deinit_if_ready();
+                break;
+
+            default:
+                break;
+        }
+    } else if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+            case WIFI_EVENT_STA_START:
+                if (s_ble_prov_active && !s_wifi_connect_allowed) {
+                    ESP_LOGI(TAG, "[WIFI] STA_START trong BLE provisioning -> chờ credential, không tự connect.");
+                } else if (s_wifi_connect_allowed) {
+                    ESP_LOGI(TAG, "[WIFI] STA_START -> connect bằng credential hiện có.");
+                    esp_wifi_connect();
+                } else {
+                    ESP_LOGI(TAG, "[WIFI] STA_START nhưng chưa có quyền connect -> skip.");
+                }
+                break;
+
+            case WIFI_EVENT_STA_DISCONNECTED:
+                s_wifi_connected = false;
+                strncpy(s_ip_addr, "0.0.0.0", sizeof(s_ip_addr));
+                xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+                if (s_ble_prov_active && !s_wifi_using_fallback) {
+                    ESP_LOGW(TAG, "[WIFI] Disconnected trong BLE provisioning -> để provisioning manager xử lý, app không retry chồng.");
+                    break;
+                }
+
+                if (s_wifi_connect_allowed) {
+                    if (s_wifi_retry_count < WIFI_MAX_RETRY) {
+                        s_wifi_retry_count++;
+                        ESP_LOGW(TAG, "[WIFI] Disconnected. Retry %d/%d", s_wifi_retry_count, WIFI_MAX_RETRY);
+                        esp_wifi_connect();
+                    } else {
+                        ESP_LOGE(TAG, "[WIFI] Kết nối credential trong NVS thất bại quá nhiều lần.");
+                        xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+                    }
+                } else {
+                    ESP_LOGW(TAG, "[WIFI] Disconnected nhưng chưa có credential/app không cho connect -> skip retry.");
+                }
+                break;
+
+            default:
+                break;
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        snprintf(s_ip_addr, sizeof(s_ip_addr), IPSTR, IP2STR(&event->ip_info.ip));
+
+        s_wifi_retry_count = 0;
         s_wifi_connected = true;
-        xTimerStop(s_wifi_timer, 0);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        ESP_LOGI(TAG, "[WIFI] ✅ Đã kết nối thành công, IP được cấp phát.");
+        ESP_LOGI(TAG, "[WIFI] ✅ Connected. IP=%s RSSI=%d", s_ip_addr, app_get_wifi_rssi());
     }
 }
 
 /**
- * @brief Khởi tạo giao diện mạng và bắt đầu quá trình dò tìm WiFi.
+ * @brief Init WiFi production: NVS credential -> BLE provisioning vô hạn, không hardcoded fallback.
  */
-static void wifi_init_sta(void) {
+static void wifi_init_ble_provisioning_or_connect(void) {
     s_wifi_event_group = xEventGroupCreate();
-    s_wifi_timer = xTimerCreate("wifi_retry", pdMS_TO_TICKS(5000), pdFALSE, NULL, wifi_retry_timer_cb);
+    ESP_ERROR_CHECK(s_wifi_event_group ? ESP_OK : ESP_ERR_NO_MEM);
+
     ESP_ERROR_CHECK(esp_netif_init());
-    esp_event_loop_create_default();
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
-    
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,    &wifi_event_handler, NULL, NULL);
-    esp_event_handler_instance_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
-    
-    wifi_config_t wcfg = {0};
-    strncpy((char *)wcfg.sta.ssid,     s_wifi_list[0].ssid, sizeof(wcfg.sta.ssid)     - 1);
-    strncpy((char *)wcfg.sta.password, s_wifi_list[0].pass, sizeof(wcfg.sta.password) - 1);
-    
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
+
+    /* Giảm log noise từ Security1 khi BLE provisioning trao đổi khóa. */
+    esp_log_level_set("security1", ESP_LOG_WARN);
+
+    ESP_ERROR_CHECK(esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &app_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &app_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &app_event_handler, NULL));
+
+    ESP_ERROR_CHECK(wifi_prov_mgr_init_if_needed());
+
+    bool provisioned = false;
+    ESP_ERROR_CHECK(network_prov_mgr_is_wifi_provisioned(&provisioned));
+
+    if (!provisioned) {
+        ESP_ERROR_CHECK(wifi_start_ble_provisioning_now("Chưa có WiFi trong NVS.", false));
+    } else {
+        s_ble_prov_active = false;
+        s_wifi_connect_allowed = true;
+        s_wifi_using_fallback = false;
+        s_wifi_retry_count = 0;
+
+        ESP_LOGI(TAG, "[WIFI] Đã có WiFi credential trong NVS. Kết nối trực tiếp.");
+        wifi_prov_mgr_deinit_if_ready();
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_start());
+    }
 }
 
 /* ==============================================================================
@@ -606,6 +1331,7 @@ static bool sensor_payload_decode(const uint8_t pt[SENSOR_PLAINTEXT_LEN], uint32
     raw.batt_volt_raw  = pt[8];
     raw.health_flag    = pt[9];
 
+    memcpy(out->plaintext, pt, SENSOR_PLAINTEXT_LEN);
     out->frame_counter = counter;             
     out->health_flag   = raw.health_flag;             
     
@@ -641,6 +1367,14 @@ static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
                      | ((uint32_t)frame[2] << 16)
                      | ((uint32_t)frame[3] << 24);
 
+#if LORA_ENABLE_RAM_REPLAY_CHECK
+    if (s_have_last_frame_counter && counter <= s_last_frame_counter) {
+        ESP_LOGW(TAG, "[LORA_RX] Bỏ frame cũ/replay. counter=%"PRIu32" last=%"PRIu32,
+                 counter, s_last_frame_counter);
+        return;
+    }
+#endif
+
     ESP_LOGI(TAG, "[LORA_RX] Gói tin Counter=%"PRIu32" — Đang giải mã ASCON-128a...", counter);
 
     uint8_t nonce[16];
@@ -661,6 +1395,17 @@ static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
         return;
     }
 
+    if (mlen != SENSOR_PLAINTEXT_LEN) {
+        ESP_LOGE(TAG, "[LORA_RX] Plaintext length sai: %llu, expected=%d",
+                 mlen, SENSOR_PLAINTEXT_LEN);
+        return;
+    }
+
+#if LORA_ENABLE_RAM_REPLAY_CHECK
+    s_last_frame_counter = counter;
+    s_have_last_frame_counter = true;
+#endif
+
     SensorDecodedData_t decoded;
     if (!sensor_payload_decode(plaintext, counter, &decoded)) return;
 
@@ -669,18 +1414,24 @@ static void process_frame(const uint8_t frame[E32_FRAME_LEN]) {
                  decoded.env_temp_c, decoded.env_humidity_pct,
                  decoded.air_pressure_hpa);
 
-        /* 1. Đẩy dữ liệu vào mô hình AI (Producer cho Queue s_ai_data_queue) */
-        AI_DataPoint_t dp = {
-            .pressure = decoded.air_pressure_hpa,
-            .humidity = decoded.env_humidity_pct,
-            .temperature = decoded.env_temp_c
-        };
-        xQueueSend(s_ai_data_queue, &dp, 0); // Không block nếu đầy
+        /* 1. Chạy MLR đồng bộ khi đồng hồ đã sync hợp lệ. */
+        if (app_time_is_valid()) {
+            decoded.predicted_temp_2h = app_predict_temp_2h(
+                decoded.env_temp_c,
+                decoded.env_humidity_pct,
+                decoded.air_pressure_hpa
+            );
+            decoded.predicted_ok = true;
+            g_mlr_predicted_temp_2h = decoded.predicted_temp_2h;
+        } else {
+            decoded.predicted_ok = false;
+            ESP_LOGW(TAG, "[MLR_TIME] Đồng hồ chưa sync, gửi predicted_temp_2h=null cho frame=%"PRIu32, counter);
+        }
     }
     
-    /* 2. Đẩy dữ liệu nguyên vẹn sang hàng đợi của Supabase HTTP POST */
+    /* 2. Đẩy dữ liệu nguyên vẹn sang hàng đợi Edge Function HTTP POST */
     if (xQueueSend(s_supabase_queue, &decoded, pdMS_TO_TICKS(10)) != pdPASS) {
-        ESP_LOGW(TAG, "[LORA_RX] ⚠ Mạng chậm, Queue Supabase đầy. Rớt gói để tránh nghẽn UART.");
+        ESP_LOGW(TAG, "[LORA_RX] ⚠ Mạng chậm, Queue Edge đầy. Rớt gói để tránh nghẽn UART.");
     }
 }
 
@@ -710,8 +1461,8 @@ static void e32_set_mode(uint8_t m0, uint8_t m1, const char *mode_name) {
     gpio_set_level(E32_M0_PIN, m0 ? 1 : 0);
     gpio_set_level(E32_M1_PIN, m1 ? 1 : 0);
 
-    /* Datasheet E32 cần một khoảng thời gian để chuyển mode. AUX HIGH nghĩa là module rảnh. */
-    vTaskDelay(pdMS_TO_TICKS(50));
+    /* E32 cần thời gian để đổi mode. AUX HIGH nghĩa là module đã rảnh. */
+    vTaskDelay(pdMS_TO_TICKS(100));
     esp_err_t aux = e32_wait_aux_high(E32_AUX_TIMEOUT_MS);
 
     ESP_LOGI(TAG, "[LORA_CFG] Mode=%s M0=%d M1=%d AUX=%d (%s)",
@@ -748,7 +1499,14 @@ static esp_err_t e32_write_config_at_baud(int baud) {
         return ESP_FAIL;
     }
 
-    /* Sau khi ghi config, module thường trả lại đúng 6 byte config. */
+    /*
+     * Rollback theo bản cũ ổn định:
+     * - E32 thường echo lại 6 byte config ngay sau khi ghi C0.
+     * - Một số module/clone không trả lời đúng lệnh readback C1 C1 C1,
+     *   hoặc đổi baud quá nhanh làm readback về 00 00 00.
+     * - Vì vậy KHÔNG dùng C1 readback làm điều kiện bắt buộc nữa.
+     * - Nếu echo đúng 6 byte config thì xem như config OK.
+     */
     uint8_t resp[16] = {0};
     int rd = uart_read_bytes(E32_UART_NUM, resp, sizeof(cfg), pdMS_TO_TICKS(1200));
 
@@ -762,17 +1520,22 @@ static esp_err_t e32_write_config_at_baud(int baud) {
         return ESP_OK;
     }
 
+    /*
+     * Không hard fail khi không echo đúng:
+     * Có trường hợp module đã nhận config nhưng không echo đủ do timing/UART buffer.
+     * Trả ESP_FAIL để thử baud kế tiếp, nhưng init vẫn sẽ đưa module về Normal và nghe thử.
+     */
     ESP_LOGW(TAG, "[LORA_CFG] E32 chưa phản hồi đúng ở baud=%d", baud);
     return ESP_FAIL;
 }
 
 /**
  * @brief Cấu hình thông số mặc định cho mạch E32 khi khởi động.
- * @details Thử 9600 trước vì E32 mặc định thường là 9600. Nếu module đã từng được
- *          cấu hình sang 115200 thì thử tiếp 115200. Sau đó đưa module về Normal mode.
+ * @details Rollback về logic cũ: thử 9600 trước, nếu không được thì thử 115200.
+ *          Không quét nhiều baud và không ép readback C1 vì làm module báo FAIL giả.
  */
 static esp_err_t lora_e32_init_config(void) {
-    ESP_LOGI(TAG, "[LORA_CFG] Bắt đầu thiết lập module E32...");
+    ESP_LOGI(TAG, "[LORA_CFG] Bắt đầu thiết lập module E32 kiểu ổn định cũ...");
 
     esp_err_t err = e32_write_config_at_baud(E32_CONFIG_BAUD);
     if (err != ESP_OK) {
@@ -789,8 +1552,13 @@ static esp_err_t lora_e32_init_config(void) {
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "[LORA_CFG] ✅ E32 đã sẵn sàng ở Normal mode, UART=%d", E32_RUN_BAUD);
     } else {
-        ESP_LOGE(TAG, "[LORA_CFG] ❌ Không xác nhận được config E32. Vẫn chuyển sang Normal mode để nghe thử.");
-        ESP_LOGE(TAG, "[LORA_CFG] Kiểm tra dây TX/RX chéo, M0/M1/AUX, nguồn E32, baud hiện tại và channel.");
+        /*
+         * Không dừng hệ thống:
+         * Nếu module đã được cấu hình từ trước hoặc readback/echo không ổn định,
+         * vẫn nghe ở RUN_BAUD để không mất gói LoRa.
+         */
+        ESP_LOGW(TAG, "[LORA_CFG] ⚠ Không xác nhận được config E32. Vẫn chuyển sang Normal mode để nghe thử.");
+        ESP_LOGW(TAG, "[LORA_CFG] Nếu không có [LORA_RX_RAW], kiểm tra TX/RX chéo, M0/M1/AUX, nguồn E32, baud và channel.");
     }
 
     return err;
@@ -864,15 +1632,25 @@ void app_main(void) {
     ESP_LOGI(TAG, "================================================");
     ESP_LOGI(TAG, "  TRẠM QUAN TRẮC MLR NOWCASTING (2H FORECAST)  ");
     ESP_LOGI(TAG, "================================================");
+    ESP_LOGI(TAG, "[VERSION] GW_VERSION=%s", GW_VERSION);
+    ESP_LOGI(TAG, "[TARGET] CONFIG_IDF_TARGET=%s", CONFIG_IDF_TARGET);
+    (void)app_update_running_sha256_cache();
 
-    /* 0. NVS dùng cho WiFi + OTA. Khởi tạo một lần ở đầu chương trình. */
+    /* 0. NVS dùng cho WiFi provisioning + OTA. */
     app_nvs_init();
 
-    /* 1. Init GPIO điều khiển LoRa E32 */
+    /* 1. Timezone phải set trước khi LoRa/MLR task chạy. */
+    app_set_timezone_utc7();
+    app_log_time_now("[TIME_BOOT]");
+
+    /* 2. Init MLR trước khi có frame LoRa đầu tiên. */
+    mlr_engine_init();
+
+    /* 3. Init GPIO điều khiển LoRa E32 */
     gpio_set_direction(E32_M0_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(E32_M1_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(E32_AUX_PIN, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(E32_AUX_PIN, GPIO_FLOATING);
+    gpio_set_pull_mode(E32_AUX_PIN, GPIO_PULLUP_ONLY);
 
     gpio_set_level(E32_M0_PIN, 0);
     gpio_set_level(E32_M1_PIN, 0);
@@ -881,7 +1659,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "[PINOUT] E32_TX(GPIO%d)->RXD_E32, E32_RX(GPIO%d)<-TXD_E32, M0=%d, M1=%d, AUX=%d",
              E32_UART_TX_PIN, E32_UART_RX_PIN, E32_M0_PIN, E32_M1_PIN, E32_AUX_PIN);
 
-    /* 2. Cài đặt UART2 cho LoRa. Ban đầu dùng 9600 để config được module factory. */
+    /* 4. Cài đặt UART2 cho LoRa. Ban đầu dùng 9600 để config được module factory. */
     ESP_ERROR_CHECK(uart_driver_install(E32_UART_NUM, 4096, 1024, 0, NULL, 0));
     uart_config_t uc = {
         .baud_rate  = E32_CONFIG_BAUD,
@@ -895,69 +1673,82 @@ void app_main(void) {
     ESP_ERROR_CHECK(uart_set_pin(E32_UART_NUM, E32_UART_TX_PIN, E32_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     uart_flush_input(E32_UART_NUM);
 
-    /* 3. Cấu hình E32: thử 9600 -> 115200, kiểm tra ACK, sau đó về Normal mode. */
+    /* 5. Cấu hình E32: thử 9600 -> 115200, kiểm tra ACK, sau đó về Normal mode. */
     esp_err_t lora_cfg_result = lora_e32_init_config();
     if (lora_cfg_result != ESP_OK) {
         ESP_LOGW(TAG, "[BOOT] LoRa config chưa xác nhận được. Xem log [LORA_CFG] để kiểm tra phần cứng.");
     }
 
-    /* 4. Tạo Queue trước khi bật task nhận LoRa để không rớt dữ liệu. */
-    s_ai_data_queue = xQueueCreate(10, sizeof(AI_DataPoint_t));
+    /* 6. Tạo queue trước khi bật task nhận LoRa để không rớt dữ liệu. */
     s_supabase_queue = xQueueCreate(20, sizeof(SensorDecodedData_t));
-
-    if (!s_ai_data_queue || !s_supabase_queue) {
-        ESP_LOGE(TAG, "[BOOT] Không tạo được queue. Restart...");
+    if (!s_supabase_queue) {
+        ESP_LOGE(TAG, "[BOOT] Không tạo được queue Edge. Restart...");
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_restart();
     }
 
-    /* 5. Bật task LoRa sớm, không chờ WiFi/NTP để tránh bỏ lỡ gói vô tuyến. */
+    /* 7. Bật task LoRa sớm, không chờ WiFi/NTP để tránh bỏ lỡ gói vô tuyến. */
     xTaskCreatePinnedToCore(lora_receiver_task, "LORA_RX_TASK", 8192, NULL, 10, NULL, 0);
 
-    /* 6. Bật AI task. Supabase/OTA sẽ bật sau khi init WiFi. */
-    xTaskCreatePinnedToCore(ai_task, "AI_TASK", 8192, NULL, 5, NULL, 1);
+    /* 8. WiFi production: NVS credential -> BLE provisioning vô hạn, không hardcoded fallback. */
+    wifi_init_ble_provisioning_or_connect();
 
-    /* 7. Kết nối mạng */
-    wifi_init_sta();
+    while (!s_wifi_connected) {
+        EventBits_t bits = xEventGroupWaitBits(
+            s_wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY
+        );
 
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
+        if (bits & WIFI_CONNECTED_BIT) {
+            break;
+        }
 
-    /* 8. Đồng bộ NTP. Nếu fail thì LoRa vẫn chạy, chỉ TLS/AI theo giờ có thể chưa chuẩn. */
-    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_setservername(1, "time.cloudflare.com");
-    esp_sntp_init();
-
-    int retry = 0;
-    const int retry_count = 20;
-    time_t now = 0;
-    struct tm timeinfo = {0};
-
-    while (timeinfo.tm_year < (2023 - 1900) && ++retry < retry_count) {
-        ESP_LOGI(TAG, "[NTP] Chờ đồng bộ thời gian từ Internet (%d/%d)...", retry, retry_count);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        time(&now);
-        localtime_r(&now, &timeinfo);
+        if (bits & WIFI_FAIL_BIT) {
+            ESP_LOGE(TAG, "[WIFI] Credential trong NVS kết nối thất bại quá nhiều lần -> chuyển sang BLE provisioning để nhập lại.");
+            xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            ESP_ERROR_CHECK(wifi_start_ble_provisioning_now("WiFi NVS fail. Vui lòng nhập lại WiFi bằng app ESP BLE Provisioning.", true));
+        }
     }
 
-    if (timeinfo.tm_year >= (2023 - 1900)) {
-        /* POSIX TZ: UTC-7 nghĩa là múi giờ thực tế UTC+7. */
-        setenv("TZ", "UTC-7", 1);
-        tzset();
-        ESP_LOGI(TAG, "[NTP] ✅ Đồng hồ đã sync chuẩn.");
-    } else {
-        ESP_LOGE(TAG, "[NTP] ❌ Đồng bộ thời gian thất bại. TLS có thể lỗi nếu đồng hồ sai.");
+    /* 9. Đồng bộ NTP. Nếu fail thì LoRa vẫn chạy, nhưng TLS/MLR theo giờ có thể chưa chuẩn. */
+    if (s_wifi_connected) {
+        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_setservername(1, "time.cloudflare.com");
+        esp_sntp_init();
+
+        int retry = 0;
+        const int retry_count = 20;
+        time_t now = 0;
+        struct tm timeinfo = {0};
+
+        while (timeinfo.tm_year < (2023 - 1900) && ++retry < retry_count) {
+            ESP_LOGI(TAG, "[NTP] Chờ đồng bộ thời gian từ Internet (%d/%d)...", retry, retry_count);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            time(&now);
+            localtime_r(&now, &timeinfo);
+        }
+
+        if (timeinfo.tm_year >= (2023 - 1900)) {
+            app_set_timezone_utc7();
+            ESP_LOGI(TAG, "[NTP] ✅ Đồng hồ đã sync chuẩn.");
+            app_log_time_now("[TIME_CHECK]");
+        } else {
+            ESP_LOGE(TAG, "[NTP] ❌ Đồng bộ thời gian thất bại. TLS có thể lỗi nếu đồng hồ sai.");
+        }
     }
 
-    /* 9. Bật task cloud sau khi network đã init. */
-    xTaskCreatePinnedToCore(supabase_task, "SBASE_TASK", 8192, NULL, 4, NULL, 0);
+    /* 10. Bật task cloud/status sau khi network đã init. */
+    xTaskCreatePinnedToCore(edge_task, "EDGE_TASK", 8192, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(gateway_status_task, "GW_STATUS_TASK", 8192, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(ota_task, "OTA_TASK", 8192, NULL, 4, NULL, 1);
 
-    ESP_LOGI(TAG, "[BOOT] Gateway đã chạy. Theo dõi log [LORA_RX_RAW] để biết UART có byte vào hay không.");
+    ESP_LOGI(TAG, "[BOOT] Gateway v%s đã chạy. LoRa RX -> Edge Function POST.", GW_VERSION);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(60000));
     }
 }
-
-
