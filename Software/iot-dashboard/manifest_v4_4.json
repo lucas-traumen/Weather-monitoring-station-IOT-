@@ -1,0 +1,11 @@
+{
+  "WEB_VERSION": "4.4",
+  "ui_update": "larger dashboard typography, visible OTA panel, aligned metric values",
+  "forecast_hours_ahead": 2,
+  "temperature_chart": {
+    "actual": "temperature at created_at",
+    "forecast": "predicted_temp_2h at created_at + 2 hours"
+  },
+  "gateway_target": "3.8.1-baseline-mlr-tzfix",
+  "edge_function": "1.3"
+}
